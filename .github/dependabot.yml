@@ -4,7 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: saturday
+      time: "01:00"
+      timezone: "Etc/GMT"
   - package-ecosystem: pip
     directory: /.github
     schedule:
       interval: weekly
+      day: saturday
+      time: "01:00"
+      timezone: "Etc/GMT"
