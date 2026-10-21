@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "prompt",
+        "prompt": "Use the agent-update-reminder custom agent to check this repository for newer ghcp-agents versions. Pass along applicable reminder-threshold preferences from loaded instructions or memory. This is an automatic startup check: honor saved reminder preferences, report qualifying updates and any incomplete checks, and do not modify installed agents or persist preferences."
+      }
+    ]
+  }
+}
