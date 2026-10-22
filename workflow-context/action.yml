@@ -1,0 +1,92 @@
+name: Workflow Context
+description: Capture event, target, pull request, and workflow-run metadata as outputs.
+
+inputs:
+  target-sha:
+    description: Optional target SHA passed through unchanged; defaults to GITHUB_SHA.
+    required: false
+    default: ""
+  github-token:
+    description: Optional token to fetch current PR details; requires pull-requests read access.
+    required: false
+    default: ""
+
+outputs:
+  event-name:
+    description: Event that triggered this workflow.
+  event-action:
+    description: Event activity, such as opened or synchronize; empty when unavailable.
+  event-sha:
+    description: Original GITHUB_SHA, independent of target-sha.
+  target-sha:
+    description: Nonempty target-sha input passed through unchanged, otherwise GITHUB_SHA.
+  action-target-branch:
+    description: PR head branch for PR contexts, otherwise the workflow branch; never inferred from target-sha.
+  ref:
+    description: Original full workflow ref.
+  ref-name:
+    description: Short workflow ref name.
+  ref-type:
+    description: Workflow ref type, branch or tag, when available.
+  tag:
+    description: Tag name for a tag ref; otherwise empty.
+  repository:
+    description: Workflow repository in owner/name form.
+  repository-owner:
+    description: Owner of the workflow repository.
+  actor:
+    description: Actor that initiated the original workflow run.
+  triggering-actor:
+    description: Actor that initiated the current run attempt, when available.
+  workflow:
+    description: Workflow name.
+  run-id:
+    description: Workflow run ID.
+  run-number:
+    description: Workflow run number.
+  run-attempt:
+    description: Workflow run attempt.
+  run-url:
+    description: URL of the workflow run, when its ID is available.
+  is-pr:
+    description: Whether the workflow has PR context, as true or false.
+  pr-details-status:
+    description: Whether selected PR details are full, partial, or none.
+  pr-details-source:
+    description: Source of PR details, event, api, or none.
+  pr-number:
+    description: PR number, when known.
+  pr-url:
+    description: PR web URL, when known.
+  pr-title:
+    description: PR title, when known.
+  pr-state:
+    description: PR state, when known.
+  pr-author:
+    description: PR author's login, when known.
+  pr-draft:
+    description: Whether the PR is a draft, as true, false, or empty when unknown.
+  pr-merged:
+    description: Whether the PR is merged, as true, false, or empty when unknown.
+  pr-is-fork:
+    description: Whether head and base repositories differ, as true, false, or empty when unknown.
+  pr-head-ref:
+    description: PR source branch, when known.
+  pr-head-sha:
+    description: PR source commit SHA, when known.
+  pr-head-repository:
+    description: PR source repository in owner/name form, when known.
+  pr-base-ref:
+    description: PR target branch, when known.
+  pr-base-sha:
+    description: PR target commit SHA, when known.
+  pr-base-repository:
+    description: PR target repository in owner/name form, when known.
+  pr-labels:
+    description: JSON array of PR label names; empty when unavailable.
+  context:
+    description: JSON object containing the other outputs, with typed booleans, arrays, and nulls.
+
+runs:
+  using: node24
+  main: index.js

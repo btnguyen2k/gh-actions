@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "01:00"
+      timezone: "Etc/GMT"
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "01:00"
+      timezone: "Etc/GMT"
+
+  - package-ecosystem: npm
+    directory: /workflow-context
+    schedule:
+      interval: weekly
+      day: saturday
+      time: "01:00"
+      timezone: "Etc/GMT"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

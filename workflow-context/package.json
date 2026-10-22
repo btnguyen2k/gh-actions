@@ -1,0 +1,11 @@
+{
+  "name": "@btnguyen2k/gh-actions-workflow-context",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
