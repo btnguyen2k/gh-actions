@@ -9,8 +9,10 @@
   Keep implementation files, dependency manifests, lockfiles, and runtime assets
   within that action's directory. Choose the runtime per action; do not impose a
   repository-wide application framework or package version.
-- Keep the root README as the action catalog. Do not add placeholder actions or
-  describe examples as published functionality.
+- Keep the root README concise and focused on business value, the action catalog,
+  and consumer-facing usage. Keep internal development, CI, and release procedures
+  in these instructions, not the README.
+- Do not add placeholder actions or describe examples as published functionality.
 
 ## Implementation and compatibility
 
@@ -55,6 +57,8 @@
   of untrusted code through `pull_request_target`.
 - CI currently validates and tests all actions. Preserve this coverage for shared
   changes if introducing path-based optimization later.
+- CI first runs the local `workflow-context` action and passes its `target-sha`
+  output to downstream checkout steps.
 
 ## Commit messages
 
@@ -81,10 +85,15 @@
   extension, not a workaround.
 - Never publish, push tags, or create GitHub releases without an explicit user
   request. Adding or updating release automation is not permission to run it.
+- If tag pushes succeed but release creation fails, rerun the failed workflow on
+  the same commit and version. Do not move immutable version tags to recover.
+- Configure repository rulesets to prevent full-version tag updates/deletions
+  while allowing major/minor alias updates. Consider immutable GitHub releases;
+  never attach GitHub releases to moving aliases or mark an action release as
+  the repository-wide "latest" release.
 - Keep workflow permissions read-only by default; scope `contents: write` to the
   publishing job. Pin external actions to full commit SHAs, with version comments.
   Supply dispatch inputs to scripts via environment variables, not shell
   interpolation.
 - Update the relevant action README and root catalog when adding an action or
-  changing its API. See the root README for usage, release recovery, Marketplace
-  limitations, and repository settings that maintainers must configure.
+  changing its API. See the root README for usage and Marketplace limitations.
