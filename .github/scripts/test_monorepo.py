@@ -62,12 +62,72 @@ class ActionLayoutTests(RepositoryTestCase):
                 monorepo.parse_version(version)
         self.assertEqual(monorepo.parse_version("0.10.2"), (0, 10, 2))
 
+    @patch("monorepo.sys.platform", "linux")
     @patch("monorepo.subprocess.run")
     def test_tests_run_from_the_action_directory(self, run):
         directory = self.add_action()
         monorepo.test_actions(self.root)
         run.assert_called_once_with(["bash", "tests/run.sh"], cwd=directory, check=True)
 
+    @patch("monorepo.sys.platform", "win32")
+    @patch("monorepo.capture")
+    @patch("monorepo.subprocess.run")
+    def test_windows_resolves_git_bash_before_launching_action_tests(self, run, capture):
+        directory = self.add_action()
+        native = self.root / "Git for Windows" / "usr" / "bin" / "bash.exe"
+        native.parent.mkdir(parents=True)
+        native.touch()
+        capture.return_value = str(native.with_name("sh.exe"))
+        monorepo.test_actions(self.root)
+        capture.assert_called_once_with(self.root, "git", "var", "GIT_SHELL_PATH")
+        run.assert_called_once_with([str(native), "tests/run.sh"], cwd=directory, check=True)
+
+    @patch("monorepo.sys.platform", "win32")
+    @patch("monorepo.capture")
+    @patch("monorepo.subprocess.run")
+    def test_windows_rejects_missing_or_relative_git_bash_without_falling_back(self, run, capture):
+        self.add_action()
+        for shell in (str(self.root / "missing-git" / "sh.exe"), "sh.exe"):
+            with self.subTest(shell=shell):
+                capture.return_value = shell
+                with self.assertRaisesRegex(FileNotFoundError, "Git for Windows Bash"):
+                    monorepo.test_actions(self.root)
+        run.assert_not_called()
+
+    @patch("monorepo.sys.platform", "win32")
+    @patch("monorepo.capture")
+    @patch("monorepo.subprocess.run")
+    def test_windows_git_shell_lookup_errors_propagate_without_falling_back(self, run, capture):
+        self.add_action()
+        failure = subprocess.CalledProcessError(1, ["git", "var", "GIT_SHELL_PATH"])
+        capture.side_effect = failure
+        with self.assertRaises(subprocess.CalledProcessError) as result:
+            monorepo.test_actions(self.root)
+        self.assertIs(result.exception, failure)
+        run.assert_not_called()
+
+    @patch("monorepo.sys.platform", "win32")
+    @patch("monorepo.capture")
+    @patch("monorepo.subprocess.run")
+    def test_empty_repository_does_not_require_a_shell(self, run, capture):
+        monorepo.test_actions(self.root)
+        capture.assert_not_called()
+        run.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "Requires native Windows.")
+    def test_windows_action_scripts_run_in_native_git_bash(self):
+        directory = self.add_action()
+        (directory / "tests" / "run.sh").write_text(
+            "set -euo pipefail\nprintf '%s' \"$OSTYPE\" > native-platform.txt\n",
+            encoding="utf-8", newline="\n",
+        )
+        monorepo.test_actions(self.root)
+        self.assertIn(
+            (directory / "native-platform.txt").read_text(encoding="utf-8"),
+            ("msys", "cygwin"),
+        )
+
+    @patch("monorepo.sys.platform", "linux")
     @patch("monorepo.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["bash"]))
     def test_action_test_failures_propagate(self, run):
         self.add_action()

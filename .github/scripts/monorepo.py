@@ -71,9 +71,20 @@ def test_actions(root: Path) -> None:
     directories = actions(root)
     if not directories:
         print("No actions found; action tests will run when the first action is added.")
+        return
+    bash = "bash"
+    if sys.platform == "win32":
+        # Windows can resolve bare bash to WSL even inside a Git Bash step.
+        native = Path(capture(root, "git", "var", "GIT_SHELL_PATH")).with_name("bash.exe")
+        if not native.is_absolute() or not native.is_file():
+            raise FileNotFoundError(
+                f"Git for Windows Bash not found at {native}. "
+                "Install Git for Windows; WSL is not supported."
+            )
+        bash = str(native)
     for directory in directories:
         print(f"Testing {directory.name}", flush=True)
-        subprocess.run(["bash", "tests/run.sh"], cwd=directory, check=True)
+        subprocess.run([bash, "tests/run.sh"], cwd=directory, check=True)
 
 
 def capture(root: Path, *command: str, stdin: str | None = None) -> str:

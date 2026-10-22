@@ -50,6 +50,9 @@
   dependency setup, and must return a nonzero exit code on failure. CI currently
   covers Ubuntu, Windows, and macOS with Node.js 24. Keep shell scripts LF-only,
   as required by `.gitattributes`, including when editing on Windows.
+- Windows tests must run natively, not in WSL. Resolve Git for Windows Bash to an
+  absolute executable path; a bare `bash` command can launch the WSL shim even
+  inside a Git Bash workflow step.
 - Add tests for invalid inputs, expected outputs, error paths, and compatibility.
   Verify committed generated files are reproducible. Add runner-specific CI
   coverage before claiming Windows or macOS support.
