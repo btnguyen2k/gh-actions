@@ -1,4 +1,4 @@
-name: Release action
+name: Release
 
 on:
   workflow_dispatch:
