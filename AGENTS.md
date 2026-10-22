@@ -48,8 +48,9 @@
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
   `tests/run.sh` runs from its own action directory through Bash, owns its
   dependency setup, and must return a nonzero exit code on failure. CI currently
-  covers Ubuntu, Windows, and macOS with Node.js 24. Keep shell scripts LF-only,
-  as required by `.gitattributes`, including when editing on Windows.
+  covers Ubuntu, Windows, and macOS with the latest Node.js LTS. Keep shell
+  scripts LF-only, as required by `.gitattributes`, including when editing on
+  Windows.
 - Windows tests must run natively, not in WSL. Resolve Git for Windows Bash to an
   absolute executable path; a bare `bash` command can launch the WSL shim even
   inside a Git Bash workflow step.
@@ -62,19 +63,32 @@
   changes if introducing path-based optimization later.
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps.
+- CI's `ParseChangelog` job reports pending action versions and their changelogs.
+  On `release/<action>` branches, inspect only that action; other branches inspect
+  all actions. Pull requests use their target/base branch for this scope.
+- Run the same report locally with `python .github\scripts\monorepo.py changelog`;
+  set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
 
 ## Commit messages
 
-- For a brand-new action, use `feat(actions): add action <action-name>`.
-- For a new version of an existing action, use
-  `type(actions/<action-name>): release <version> - <description>`.
-  Choose the appropriate commit type and keep the description short and concise.
+- For action changes, use `type(action): <description>` for every release,
+  including a brand-new action's first release. Choose the appropriate commit
+  type and keep the description short, concise, and focused on the actual change.
+- The changelog section header supplies the action name and release version.
+  Do not repeat them as add-action announcements or release-version prefixes;
+  use the literal scope `action`, not an action-specific scope.
 - If an action version includes multiple updates, generate a separate
-  release-format commit message for each update rather than combining them into
-  one message.
+  commit message for each update rather than combining them into one message.
 
 ## Releases and workflows
 
+- Stage release notes in `.semrelease/this_release` under
+  `#!<action-name>/v<version-number>` headers, allowing zero or more spaces after
+  `#!`. Blank lines and ordinary `#` comment lines do not count as changelog entries.
+- Changelog reporting warns and excludes malformed headers, invalid action names
+  or stable versions, unknown actions, empty sections, and multiple non-empty
+  sections for one action. A release branch with no valid matching section also
+  warns. These warnings do not fail the job; unreadable or missing files do.
 - Actions are versioned independently. Full release tags are
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable

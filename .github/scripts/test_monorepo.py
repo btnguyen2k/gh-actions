@@ -1,3 +1,4 @@
+import io
 import os
 import subprocess
 import sys
@@ -183,6 +184,288 @@ class ActionLayoutTests(RepositoryTestCase):
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(ValueError, "default branch"):
                 monorepo.release(self.root)
+
+
+class ChangelogTests(RepositoryTestCase):
+    def setUp(self):
+        super().setUp()
+        self.add_action()
+        self.add_action("second-action")
+        self.known_actions = {"example-action", "second-action"}
+
+    def parse(self, text, selected_action=None):
+        return monorepo.parse_changelog(text, self.known_actions, selected_action)
+
+    def write_changelog(self, text, encoding="utf-8"):
+        path = self.root / ".semrelease" / "this_release"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text, encoding=encoding)
+
+    def report(self, text, branch, encoding="utf-8"):
+        self.write_changelog(text, encoding)
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CHANGELOG_BRANCH": branch}), patch("sys.stdout", output):
+            monorepo.changelog(self.root)
+        return output.getvalue()
+
+    def test_parses_versions_notes_and_source_lines_in_file_order(self):
+        sections, warnings = self.parse(
+            "# Instructions\n\n"
+            "#!example-action/v0.1.0\n"
+            "- feat(action): capture workflow metadata\n"
+            "\n  Additional details.\n\n"
+            "#! second-action/v2.3.4\n"
+            "- fix(action): preserve values\n"
+        )
+        self.assertEqual(sections, [
+            monorepo.ReleaseSection(
+                "example-action", "0.1.0",
+                "- feat(action): capture workflow metadata\n\n  Additional details.", 3,
+            ),
+            monorepo.ReleaseSection(
+                "second-action", "2.3.4",
+                "- fix(action): preserve values", 8,
+            ),
+        ])
+        self.assertEqual(warnings, [])
+
+    def test_accepts_optional_spaces_after_marker_and_crlf(self):
+        for spaces in ("", " ", "    "):
+            with self.subTest(spaces=spaces):
+                sections, warnings = self.parse(
+                    f"#!{spaces}example-action/v1.2.3  \r\n- First update\r\n"
+                    "- Second update\r\n"
+                )
+                self.assertEqual(sections, [
+                    monorepo.ReleaseSection(
+                        "example-action", "1.2.3", "- First update\n- Second update", 1,
+                    ),
+                ])
+                self.assertEqual(warnings, [])
+
+    def test_ignores_comments_but_preserves_note_indentation(self):
+        sections, warnings = self.parse(
+            "# Preamble\n\n#!example-action/v1.2.3\n"
+            "# Maintainer comment\n    Indented note\n\n    More detail\n# Footer\n"
+        )
+        self.assertEqual(sections[0].notes, "    Indented note\n\n    More detail")
+        self.assertEqual(warnings, [])
+
+    def test_warns_on_invalid_sections_without_losing_later_valid_sections(self):
+        invalid = {
+            "#!": "expected #!",
+            "#!example-action/1.2.3": "expected #!",
+            "#!\texample-action/v1.2.3": "expected #!",
+            "  #!example-action/v1.2.3": "expected #!",
+            "#!Example/v1.2.3": "lowercase kebab-case",
+            "#!example_action/v1.2.3": "lowercase kebab-case",
+            "#!../v1.2.3": "lowercase kebab-case",
+            "#!example-action/v1.2": "MAJOR.MINOR.PATCH",
+            "#!example-action/v01.2.3": "MAJOR.MINOR.PATCH",
+            "#!example-action/v1.2.3-rc.1": "MAJOR.MINOR.PATCH",
+            "#!example-action/v1.2.3+build": "MAJOR.MINOR.PATCH",
+            "#!unknown-action/v1.2.3": "Unknown action",
+        }
+        for header, message in invalid.items():
+            with self.subTest(header=header):
+                sections, warnings = self.parse(
+                    f"{header}\n- Invalid section\n"
+                    "#!second-action/v2.3.4\n- Valid section\n"
+                )
+                self.assertEqual(sections, [
+                    monorepo.ReleaseSection("second-action", "2.3.4", "- Valid section", 3),
+                ])
+                self.assertEqual(len(warnings), 1)
+                self.assertEqual(warnings[0][0], 1)
+                self.assertIn(message, warnings[0][1])
+
+    def test_warns_on_content_before_any_release_header(self):
+        sections, warnings = self.parse(
+            "# Instructions\n- Unscoped update\n#!example-action/v1.2.3\n- Update\n"
+        )
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(warnings, [
+            (2, "Changelog content outside a #! release section is ignored."),
+        ])
+
+    def test_empty_sections_do_not_consume_the_next_sections_notes(self):
+        sections, warnings = self.parse(
+            "#!example-action/v1.2.3\n\n# Comment\n"
+            "#!second-action/v2.3.4\n- Valid section\n"
+        )
+        self.assertEqual(sections, [
+            monorepo.ReleaseSection("second-action", "2.3.4", "- Valid section", 4),
+        ])
+        self.assertEqual(warnings, [
+            (1, "Release section example-action/v1.2.3 has no changelog entries."),
+        ])
+
+    def test_rejects_duplicate_and_conflicting_versions_instead_of_picking_one(self):
+        for version in ("1.2.3", "1.2.4"):
+            with self.subTest(version=version):
+                sections, warnings = self.parse(
+                    "#!example-action/v1.2.3\n- First section\n"
+                    f"#!example-action/v{version}\n- Second section\n"
+                    "#!second-action/v2.3.4\n- Valid section\n"
+                )
+                self.assertEqual(sections, [
+                    monorepo.ReleaseSection("second-action", "2.3.4", "- Valid section", 5),
+                ])
+                self.assertEqual([line for line, _ in warnings], [1, 3])
+                self.assertTrue(all("Multiple release sections" in message for _, message in warnings))
+
+    def test_action_scope_ignores_unrelated_notes_and_invalid_sections(self):
+        sections, warnings = self.parse(
+            "Unscoped content\n"
+            "#!second-action/not-a-version\n- Other action\n"
+            "#!unknown-action/v01.2.3\n- Unknown action\n"
+            "#!example-action/v1.2.3\n- Selected action\n"
+            "#!example-action-extra/v1.2.3\n- Similar name\n",
+            "example-action",
+        )
+        self.assertEqual(sections, [
+            monorepo.ReleaseSection("example-action", "1.2.3", "- Selected action", 6),
+        ])
+        self.assertEqual(warnings, [])
+
+    def test_action_scope_still_warns_on_malformed_headers_for_that_action(self):
+        sections, warnings = self.parse(
+            "#!example-action/not-a-version\n- Invalid\n"
+            "#!second-action/not-a-version\n- Unrelated\n",
+            "example-action",
+        )
+        self.assertEqual(sections, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0][0], 1)
+        self.assertIn("Invalid release section header", warnings[0][1])
+
+    def test_empty_or_comment_only_common_changelog_is_not_a_warning(self):
+        for text in ("", "\n# Cleaned up\n\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.parse(text), ([], []))
+                output = self.report(text, "main")
+                self.assertIn("Pending releases: 0\n", output)
+                self.assertNotIn("::warning", output)
+
+    def test_common_branches_report_every_actions_version_and_changelog(self):
+        for branch in ("main", "dev", "feature/changelog", ""):
+            with self.subTest(branch=branch):
+                output = self.report(
+                    "#!example-action/v1.2.3\n- First notes\n"
+                    "#!second-action/v2.3.4\n- Second notes\n",
+                    branch,
+                )
+                self.assertIn("Release scope: all actions\nPending releases: 2\n", output)
+                self.assertIn(
+                    "Action: example-action\nVersion: 1.2.3\n"
+                    "Tag: example-action/v1.2.3\nChangelog:\n- First notes\n",
+                    output,
+                )
+                self.assertIn(
+                    "Action: second-action\nVersion: 2.3.4\n"
+                    "Tag: second-action/v2.3.4\nChangelog:\n- Second notes\n",
+                    output,
+                )
+                self.assertNotIn("::warning", output)
+
+    def test_release_branch_reports_only_its_action(self):
+        output = self.report(
+            "#!example-action/v1.2.3\n- First notes\n"
+            "#!second-action/v2.3.4\n- Second notes\n",
+            "release/second-action",
+        )
+        self.assertIn("Release scope: action 'second-action'\nPending releases: 1\n", output)
+        self.assertIn("Action: second-action\n", output)
+        self.assertIn("- Second notes\n", output)
+        self.assertNotIn("example-action", output)
+        self.assertNotIn("- First notes", output)
+        self.assertNotIn("::warning", output)
+
+    def test_release_branch_warns_for_missing_empty_invalid_or_ambiguous_sections(self):
+        for text in (
+            "",
+            "# Cleaned up\n",
+            "#!second-action/v2.3.4\n- Other action\n",
+            "#!example-action/v1.2.3\n# No notes\n",
+            "#!example-action/v01.2.3\n- Invalid version\n",
+            "#!example-action/v1.2.3\n- First\n#!example-action/v1.2.4\n- Second\n",
+        ):
+            with self.subTest(text=text):
+                output = self.report(text, "release/example-action")
+                self.assertIn("Pending releases: 0\n", output)
+                self.assertIn(
+                    "::warning file=.semrelease/this_release,line=1::"
+                    "No valid, non-empty release sections found for action 'example-action'",
+                    output,
+                )
+
+    def test_malformed_release_branch_never_falls_back_to_all_actions(self):
+        for branch in ("release/", "release/unknown-action", "release/example-action/nested"):
+            with self.subTest(branch=branch):
+                output = self.report("#!example-action/v1.2.3\n- Notes\n", branch)
+                self.assertIn("Pending releases: 0\n", output)
+                self.assertNotIn("Release scope: all actions", output)
+                self.assertIn("No valid, non-empty release sections", output)
+
+    def test_reads_utf8_bom_and_preserves_unicode_notes(self):
+        output = self.report(
+            "#!example-action/v1.2.3\n- Preserve caf\u00e9 values\n",
+            "main", encoding="utf-8-sig",
+        )
+        self.assertIn("- Preserve caf\u00e9 values\n", output)
+        self.assertNotIn("::warning", output)
+
+    def test_prints_untrusted_notes_with_runner_commands_disabled(self):
+        output = self.report(
+            "#!example-action/v1.2.3\n::error::Literal note\n"
+            "::warning::Another literal note\n::endgroup::\n"
+            "#!bad%name/v1.2.3\n- Invalid section\n",
+            "main",
+        )
+        token = output.splitlines()[0].removeprefix("::stop-commands::")
+        self.assertEqual(len(token), 32)
+        protected, annotations = output.split(f"::{token}::\n")
+        self.assertIn("::error::Literal note\n", protected)
+        self.assertIn("::warning::Another literal note\n", protected)
+        self.assertNotIn("::error::", annotations)
+        self.assertIn("::warning file=.semrelease/this_release,line=5::", annotations)
+        self.assertIn("bad%25name", annotations)
+
+    def test_runner_command_resume_token_cannot_collide_with_notes(self):
+        collision = monorepo.uuid.UUID(int=0)
+        safe = monorepo.uuid.UUID(int=1)
+        with patch("monorepo.uuid.uuid4", side_effect=[collision, safe]):
+            output = self.report(
+                f"#!example-action/v1.2.3\n::{collision.hex}::\n", "main",
+            )
+        self.assertTrue(output.startswith(f"::stop-commands::{safe.hex}\n"))
+        self.assertIn(f"\n::{collision.hex}::\n", output)
+        self.assertTrue(output.endswith(f"\n::{safe.hex}::\n"))
+
+    def test_changelog_command_warns_without_failing(self):
+        self.write_changelog("#!example-action/v01.2.3\n- Invalid version\n")
+        output = io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch("sys.argv", ["monorepo.py", "changelog"]),
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "main"}),
+            patch("sys.stdout", output),
+        ):
+            self.assertIsNone(monorepo.main())
+        self.assertIn("::warning file=.semrelease/this_release,line=1::", output.getvalue())
+
+    def test_changelog_command_fails_explicitly_when_file_is_missing(self):
+        error = io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch("sys.argv", ["monorepo.py", "changelog"]),
+            patch("sys.stderr", error),
+            self.assertRaises(SystemExit) as result,
+        ):
+            monorepo.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("error:", error.getvalue())
+        self.assertIn("this_release", error.getvalue())
 
 
 class ReleaseCommandTests(RepositoryTestCase):

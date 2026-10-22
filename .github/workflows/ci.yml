@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHON_VERSION: "3.12"
+
 jobs:
   CaptureContext:
     name: Capture workflow context
@@ -17,6 +20,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       target-sha: ${{ steps.context.outputs.target-sha }}
+      action-target-branch: ${{ steps.context.outputs.action-target-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -36,6 +40,26 @@ jobs:
           printf 'Target SHA: %s\n' "$TARGET_SHA"
           printf 'Target branch: %s\n' "$TARGET_BRANCH"
           printf 'PR number: %s\n' "$PR_NUMBER"
+
+  ParseChangelog:
+    name: Parse release changelog
+    needs: CaptureContext
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.CaptureContext.outputs.target-sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Report pending releases
+        env:
+          CHANGELOG_BRANCH: ${{ github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
+        run: python .github/scripts/monorepo.py changelog
 
   Validate:
     name: Validate and test (${{ matrix.os }})
@@ -58,11 +82,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: "24"
+          node-version: "lts/*"
+          check-latest: true
       - name: Install repository tooling
         run: python -m pip install --disable-pip-version-check --requirement .github/requirements.txt
       - name: Validate repository metadata
