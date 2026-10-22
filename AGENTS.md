@@ -44,8 +44,10 @@
 - Test repository tooling with
   `python -m unittest discover --start-directory .github\scripts --pattern "test_*.py"`.
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
-  `tests/run.sh` runs from its own action directory on Ubuntu, owns its dependency
-  setup, and must return a nonzero exit code on failure.
+  `tests/run.sh` runs from its own action directory through Bash, owns its
+  dependency setup, and must return a nonzero exit code on failure. CI currently
+  covers Ubuntu, Windows, and macOS with Node.js 24. Keep shell scripts LF-only,
+  as required by `.gitattributes`, including when editing on Windows.
 - Add tests for invalid inputs, expected outputs, error paths, and compatibility.
   Verify committed generated files are reproducible. Add runner-specific CI
   coverage before claiming Windows or macOS support.
@@ -53,6 +55,16 @@
   of untrusted code through `pull_request_target`.
 - CI currently validates and tests all actions. Preserve this coverage for shared
   changes if introducing path-based optimization later.
+
+## Commit messages
+
+- For a brand-new action, use `feat(actions): add action <action-name>`.
+- For a new version of an existing action, use
+  `type(actions/<action-name>): release <version> - <description>`.
+  Choose the appropriate commit type and keep the description short and concise.
+- If an action version includes multiple updates, generate a separate
+  release-format commit message for each update rather than combining them into
+  one message.
 
 ## Releases and workflows
 

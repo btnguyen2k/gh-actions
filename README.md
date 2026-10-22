@@ -5,6 +5,12 @@ A collection of reusable GitHub actions for common development tasks.
 Each action lives in its own directory at the repository root and is versioned
 independently using **action-prefixed tags**. There are no published actions yet.
 
+## Actions
+
+| Action | Purpose | Status |
+| --- | --- | --- |
+| [workflow-context](workflow-context/README.md) | Capture event, target SHA/branch, PR details, and workflow-run metadata as outputs. | Unreleased |
+
 ## Repository layout
 
 The layout for each new action is:
@@ -72,8 +78,9 @@ Changes to shared tooling therefore exercise all actions, not just changed paths
 Each action owns its implementation language, dependency manifests, lockfiles,
 and tests. Its test entrypoint must install its development dependencies, fail on
 test errors, and check that any committed runtime bundles are up to date. CI also
-rejects changes to tracked files left by tests. The initial runner is Ubuntu; add
-coverage for other supported operating systems before claiming support for them.
+rejects changes to tracked files left by tests. CI currently runs on Ubuntu,
+Windows, and macOS, with Python 3.12 and Node.js 24 available for repository and
+action tests.
 Pull-request tests must not require secrets or elevated repository permissions.
 
 ## Releasing an action
