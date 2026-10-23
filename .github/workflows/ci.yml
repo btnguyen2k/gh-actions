@@ -68,7 +68,7 @@ jobs:
         run: python .github/scripts/monorepo.py changelog
 
   PreviewRelease:
-    name: Preview release (${{ matrix.action }})
+    name: Preview release (action - ${{ matrix.action }})
     needs: [CaptureContext, ParseChangelog]
     if: ${{ needs.ParseChangelog.outputs.has-releases == 'true' && github.event.deleted != true }}
     strategy:
