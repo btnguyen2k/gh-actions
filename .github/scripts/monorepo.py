@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -61,6 +62,9 @@ def validate(root: Path) -> None:
     else:
         print("No actions found; action metadata validation is not yet applicable.")
     for schema, files in groups:
+        print(f"Validating {schema}:", flush=True)
+        for path in files:
+            print(f"  - {path.relative_to(root).as_posix()}", flush=True)
         subprocess.run(
             [sys.executable, "-m", "check_jsonschema", "--builtin-schema",
              f"vendor.{schema}", *map(str, files)],
@@ -120,18 +124,20 @@ def parse_changelog(
             candidate is None or candidate[1] != selected_action
         ):
             continue
-        match = re.fullmatch(r"#! *([^/\s]+)/v(\S+)", header.rstrip())
+        match = re.fullmatch(r"#! *([^/\s]+)(?:/v(\S+))?", header.rstrip())
         if not match:
             warnings.append((
                 index + 1,
                 f"Invalid release section header {header!r}; "
-                "expected #!<action-name>/v<version-number>.",
+                "expected #!<action-name> or #!<action-name>/v<version-number>.",
             ))
             continue
-        action, version = match.groups()
+        action = match[1]
+        version = match[2] or ""
         try:
             validate_name(action)
-            parse_version(version)
+            if version:
+                parse_version(version)
         except ValueError as error:
             warnings.append((index + 1, f"Invalid release section {header!r}: {error}"))
             continue
@@ -143,7 +149,8 @@ def parse_changelog(
             line for line in lines[index + 1:end] if not line.lstrip().startswith("#")
         ).strip("\n")
         if not notes.strip():
-            warnings.append((index + 1, f"Release section {action}/v{version} has no changelog entries."))
+            label = f"{action}/v{version}" if version else action
+            warnings.append((index + 1, f"Release section {label} has no changelog entries."))
             continue
         sections.append(ReleaseSection(action, version, notes, index + 1))
     counts = {}
@@ -163,7 +170,8 @@ def parse_changelog(
 
 def changelog(root: Path) -> None:
     branch = os.environ.get("CHANGELOG_BRANCH", "")
-    selected_action = branch[len("release/"):] if branch.startswith("release/") else None
+    prefix, separator, action = branch.partition("/")
+    selected_action = action if separator and prefix else None
     sections, warnings = parse_changelog(
         (root / ".semrelease" / "this_release").read_text(encoding="utf-8-sig"),
         {directory.name for directory in actions(root)},
@@ -185,22 +193,71 @@ def changelog(root: Path) -> None:
         report.extend((
             "",
             f"Action: {section.action}",
-            f"Version: {section.version}",
-            f"Tag: {section.action}/v{section.version}",
+            f"Version: {section.version or '(automatic)'}",
+            f"Tag prefix: {section.action}/v",
             "Changelog:",
             section.notes,
         ))
-    output = "\n".join(report)
-    token = uuid.uuid4().hex
-    while token in output:
-        token = uuid.uuid4().hex
-    # Release notes must be printed as data, not interpreted as runner commands.
-    print(f"::stop-commands::{token}", flush=True)
-    print(output, flush=True)
-    print(f"::{token}::", flush=True)
+    print_workflow_data("\n".join(report))
     for line, message in warnings:
         escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(f"::warning file=.semrelease/this_release,line={line}::{escaped}", flush=True)
+    if output_path := os.environ.get("GITHUB_OUTPUT"):
+        matrix = {"include": [
+            {
+                "action": section.action,
+                "version": section.version,
+                "tag-prefix": f"{section.action}/v",
+                "change-log": section.notes,
+            }
+            for section in sections
+        ]}
+        with Path(output_path).open("a", encoding="utf-8", newline="\n") as output:
+            output.write(f"matrix={json.dumps(matrix, ensure_ascii=True)}\n")
+            output.write(f"has-releases={'true' if sections else 'false'}\n")
+
+
+def print_workflow_data(output: str) -> None:
+    token = uuid.uuid4().hex
+    while token in output:
+        token = uuid.uuid4().hex
+    # Reports may contain untrusted messages, not runner commands.
+    print(f"::stop-commands::{token}", flush=True)
+    print(output, flush=True)
+    print(f"::{token}::", flush=True)
+
+
+def release_preview(_root: Path) -> None:
+    required = ("ACTION_NAME", "RELEASE_RESULT", "RELEASE_VERSION", "RELEASE_NOTES")
+    missing = [name for name in required if name not in os.environ]
+    if missing:
+        raise ValueError(f"Missing release preview environment variables: {', '.join(missing)}.")
+    action = os.environ["ACTION_NAME"]
+    validate_name(action)
+    result = os.environ["RELEASE_RESULT"]
+    version = os.environ["RELEASE_VERSION"]
+    notes = os.environ["RELEASE_NOTES"]
+    if result not in ("SUCCESS", "SKIPPED", "FAILED"):
+        raise ValueError(f"Invalid release preview result: {result!r}.")
+    if result == "SUCCESS" and (not version.strip() or not notes.strip()):
+        raise ValueError("A successful release preview must include releaseVersion and releaseNotes.")
+    print_workflow_data("\n".join((
+        f"Action: {action}",
+        f"result: {result}",
+        f"releaseVersion: {version}",
+        "releaseNotes:",
+        notes,
+    )))
+    if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(summary_path).open("a", encoding="utf-8", newline="\n") as summary:
+            summary.write(
+                f"## Release preview: `{action}`\n\n"
+                f"- result: `{result}`\n"
+                f"- releaseVersion: `{version}`\n\n"
+                f"### releaseNotes\n\n{notes}\n\n"
+            )
+    if result == "FAILED":
+        raise ValueError(f"Release preview for {action} failed; see action-semrelease logs.")
 
 
 def capture(root: Path, *command: str, stdin: str | None = None) -> str:
@@ -313,13 +370,16 @@ def release(root: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Validate, test, inspect changelogs, or release this action monorepo."
+        description="Validate, test, plan or preview releases, or release this action monorepo."
     )
-    parser.add_argument("command", choices=("validate", "test", "changelog", "release"))
+    parser.add_argument(
+        "command", choices=("validate", "test", "changelog", "release-preview", "release"),
+    )
     args = parser.parse_args()
     try:
         {
-            "validate": validate, "test": test_actions, "changelog": changelog, "release": release,
+            "validate": validate, "test": test_actions, "changelog": changelog,
+            "release-preview": release_preview, "release": release,
         }[args.command](ROOT)
     except (ValueError, FileNotFoundError) as error:
         parser.exit(1, f"error: {error}\n")

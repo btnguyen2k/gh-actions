@@ -44,7 +44,8 @@
 - Repository tooling requires Python 3.12+. Install its dependencies from
   `.github/requirements.txt`, preferably in a virtual environment.
 - Validate repository metadata with
-  `python .github\scripts\monorepo.py validate`.
+  `python .github\scripts\monorepo.py validate`. The log lists each schema group
+  and the files being checked.
 - Test repository tooling with
   `python -m unittest discover --start-directory .github\scripts --pattern "test_*.py"`.
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
@@ -65,18 +66,26 @@
   changes if introducing path-based optimization later.
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps.
-- CI's `ParseChangelog` job reports pending action versions and their changelogs.
-  On `release/<action>` branches, inspect only that action; other branches inspect
-  all actions. Pull requests use their target/base branch for this scope.
+- CI's `ParseChangelog` job reports pending action releases and exports their
+  inputs as a matrix. On `<prefix>/<action>` branches with any non-empty prefix,
+  inspect only that action; branches without such a prefix inspect all actions.
+  Pull requests use their target/base branch for this scope.
+- CI's `PreviewRelease` job invokes pinned `btnguyen2k/action-semrelease` in
+  read-only dry-run mode for each selected section. Capture `result`,
+  `releaseVersion`, and `releaseNotes` in each matrix job's logs and summary, not
+  shared matrix job outputs that could overwrite one another. Validate the
+  captured target SHA against the full workflow ref, including PR merge refs.
 - Run the same report locally with `python .github\scripts\monorepo.py changelog`;
   set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
+  This command prepares release inputs; version calculation and final release
+  notes are delegated to action-semrelease in CI, not implemented in Python.
 
 ## Commit messages
 
 - For action changes, use `type(action): <description>` for every release,
   including a brand-new action's first release. Choose the appropriate commit
   type and keep the description short, concise, and focused on the actual change.
-- The changelog section header supplies the action name and release version.
+- The changelog section header supplies the action name and optional release version.
   Do not repeat them as add-action announcements or release-version prefixes;
   use the literal scope `action`, not an action-specific scope.
 - If an action version includes multiple updates, generate a separate
@@ -85,12 +94,18 @@
 ## Releases and workflows
 
 - Stage release notes in `.semrelease/this_release` under
-  `#!<action-name>/v<version-number>` headers, allowing zero or more spaces after
-  `#!`. Blank lines and ordinary `#` comment lines do not count as changelog entries.
+  `#!<action-name>/v<version-number>` for a fixed version or `#!<action-name>` for
+  automatic versioning, allowing zero or more spaces after `#!`. Pass
+  `<action-name>/v` as `tag-prefix`, the fixed version or an empty string as
+  `version`, and the section's multiline messages as `change-log`. Do not use
+  repository-wide `#!VERSION` directives. Blank lines and ordinary `#` comment
+  lines do not count as changelog entries.
 - Changelog reporting warns and excludes malformed headers, invalid action names
   or stable versions, unknown actions, empty sections, and multiple non-empty
-  sections for one action. A release branch with no valid matching section also
-  warns. These warnings do not fail the job; unreadable or missing files do.
+  sections for one action. An action-scoped branch with no valid matching section
+  also warns. These warnings do not fail the parser; unreadable
+  or missing files do. An empty plan skips release previews; action-semrelease
+  failures still fail CI, and `SKIPPED` remains distinct from `SUCCESS`.
 - Actions are versioned independently. Full release tags are
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable

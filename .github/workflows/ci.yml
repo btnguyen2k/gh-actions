@@ -46,6 +46,9 @@ jobs:
     needs: CaptureContext
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.changelog.outputs.matrix }}
+      has-releases: ${{ steps.changelog.outputs.has-releases }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,9 +60,49 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Report pending releases
+        id: changelog
         env:
           CHANGELOG_BRANCH: ${{ github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
         run: python .github/scripts/monorepo.py changelog
+
+  PreviewRelease:
+    name: Preview release (${{ matrix.action }})
+    needs: [CaptureContext, ParseChangelog]
+    if: ${{ needs.ParseChangelog.outputs.has-releases == 'true' && github.event.deleted != true }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.ParseChangelog.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.CaptureContext.outputs.target-sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Calculate release version and notes
+        id: semrelease
+        uses: btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d # v5.1.0
+        with:
+          github-token: ${{ github.token }}
+          dry-run: true
+          target-sha: ${{ needs.CaptureContext.outputs.target-sha }}
+          branches: ${{ github.ref }}
+          tag-prefix: ${{ matrix.tag-prefix }}
+          version: ${{ matrix.version }}
+          change-log: ${{ matrix.change-log }}
+      - name: Report release preview
+        if: ${{ !cancelled() && (steps.semrelease.outcome == 'success' || steps.semrelease.outcome == 'failure') }}
+        env:
+          ACTION_NAME: ${{ matrix.action }}
+          RELEASE_RESULT: ${{ steps.semrelease.outputs.result }}
+          RELEASE_VERSION: ${{ steps.semrelease.outputs.releaseVersion }}
+          RELEASE_NOTES: ${{ steps.semrelease.outputs.releaseNotes }}
+        run: python .github/scripts/monorepo.py release-preview
 
   Validate:
     name: Validate and test (${{ matrix.os }})
