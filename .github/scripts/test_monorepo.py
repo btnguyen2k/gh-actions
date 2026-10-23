@@ -19,7 +19,7 @@ class RepositoryTestCase(unittest.TestCase):
 
     def add_action(self, name="example-action"):
         directory = self.root / name
-        for filename in ("action.yml", "README.md", "tests/run.sh"):
+        for filename in ("action.yml", "README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             path = directory / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("", encoding="utf-8")
@@ -38,13 +38,22 @@ class ActionLayoutTests(RepositoryTestCase):
 
     def test_requires_documentation_and_test_entrypoint(self):
         directory = self.add_action()
-        for filename in ("README.md", "tests/run.sh"):
+        for filename in ("README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             with self.subTest(filename=filename):
                 path = directory / filename
                 path.unlink()
-                with self.assertRaisesRegex(ValueError, "missing"):
+                with self.assertRaises(ValueError) as error:
                     monorepo.actions(self.root)
+                self.assertEqual(str(error.exception), f"example-action: missing {filename}.")
                 path.write_text("", encoding="utf-8")
+
+    def test_rejects_directory_in_place_of_release_notes(self):
+        path = self.add_action() / "RELEASE-NOTES.md"
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(ValueError) as error:
+            monorepo.actions(self.root)
+        self.assertEqual(str(error.exception), "example-action: missing RELEASE-NOTES.md.")
 
     def test_rejects_root_metadata_and_alternate_filename(self):
         for path in (self.root / "action.yml", self.root / "example" / "action.yaml"):

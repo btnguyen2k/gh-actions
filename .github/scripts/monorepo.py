@@ -37,7 +37,7 @@ def actions(root: Path) -> list[Path]:
         if not (directory / "action.yml").exists():
             continue
         validate_name(directory.name)
-        for filename in ("action.yml", "README.md", "tests/run.sh"):
+        for filename in ("action.yml", "README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             if not (directory / filename).is_file():
                 raise ValueError(f"{directory.name}: missing {filename}.")
         result.append(directory)
