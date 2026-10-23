@@ -13,6 +13,8 @@
   and consumer-facing usage. Keep internal development, CI, and release procedures
   in these instructions, not the README.
 - Do not add placeholder actions or describe examples as published functionality.
+- `dummy` is an internal release-flow test action, not a public catalog entry.
+  Keep it out of the root README and do not present it as production functionality.
 
 ## Implementation and compatibility
 
