@@ -101,6 +101,12 @@ class ReleaseSection:
     line: int
 
 
+class ChangelogError(ValueError):
+    def __init__(self, message: str, warnings: list[tuple[int, str]]) -> None:
+        super().__init__(message)
+        self.warnings = warnings
+
+
 def parse_changelog(
     text: str, known_actions: set[str], selected_action: str | None = None
 ) -> tuple[list[ReleaseSection], list[tuple[int, str]]]:
@@ -110,6 +116,7 @@ def parse_changelog(
     ]
     sections = []
     warnings = []
+    header_lines: dict[str, list[int]] = {}
     if selected_action is None:
         for index in range(headers[0] if headers else len(lines)):
             if lines[index].strip() and not lines[index].lstrip().startswith("#"):
@@ -144,6 +151,7 @@ def parse_changelog(
         if action not in known_actions:
             warnings.append((index + 1, f"Unknown action {action!r}: no action.yml found."))
             continue
+        header_lines.setdefault(action, []).append(index + 1)
         end = headers[position + 1] if position + 1 < len(headers) else len(lines)
         notes = "\n".join(
             line for line in lines[index + 1:end] if not line.lstrip().startswith("#")
@@ -153,30 +161,48 @@ def parse_changelog(
             warnings.append((index + 1, f"Release section {label} has no changelog entries."))
             continue
         sections.append(ReleaseSection(action, version, notes, index + 1))
-    counts = {}
-    for section in sections:
-        counts[section.action] = counts.get(section.action, 0) + 1
-    for section in sections:
-        if counts[section.action] > 1:
-            warnings.append((
-                section.line,
-                f"Multiple release sections for action {section.action!r}; "
-                "keep exactly one pending version per action.",
-            ))
-    return [
-        section for section in sections if counts[section.action] == 1
-    ], sorted(warnings)
+    duplicates = [
+        f"Multiple release sections for action {action!r} at lines "
+        f"{', '.join(map(str, positions))}; keep exactly one section per action."
+        for action, positions in header_lines.items() if len(positions) > 1
+    ]
+    warnings.sort()
+    if duplicates:
+        raise ChangelogError("\n".join(duplicates), warnings)
+    return sections, warnings
+
+
+def print_changelog_warnings(warnings: list[tuple[int, str]]) -> None:
+    for line, message in warnings:
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::warning file=.semrelease/this_release,line={line}::{escaped}", flush=True)
+
+
+def load_changelog(
+    root: Path, selected_action: str | None = None
+) -> tuple[list[ReleaseSection], list[tuple[int, str]]]:
+    try:
+        return parse_changelog(
+            (root / ".semrelease" / "this_release").read_text(encoding="utf-8-sig"),
+            {directory.name for directory in actions(root)},
+            selected_action,
+        )
+    except ChangelogError as error:
+        print_changelog_warnings(error.warnings)
+        raise
+
+
+def validate_changelog(root: Path) -> None:
+    sections, warnings = load_changelog(root)
+    print_changelog_warnings(warnings)
+    print(f"Changelog validation passed ({len(sections)} non-empty sections).", flush=True)
 
 
 def changelog(root: Path) -> None:
     branch = os.environ.get("CHANGELOG_BRANCH", "")
     prefix, separator, action = branch.partition("/")
     selected_action = action if separator and prefix else None
-    sections, warnings = parse_changelog(
-        (root / ".semrelease" / "this_release").read_text(encoding="utf-8-sig"),
-        {directory.name for directory in actions(root)},
-        selected_action,
-    )
+    sections, warnings = load_changelog(root, selected_action)
     if selected_action is not None and not sections:
         warnings.append((
             1,
@@ -199,9 +225,7 @@ def changelog(root: Path) -> None:
             section.notes,
         ))
     print_workflow_data("\n".join(report))
-    for line, message in warnings:
-        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::warning file=.semrelease/this_release,line={line}::{escaped}", flush=True)
+    print_changelog_warnings(warnings)
     if output_path := os.environ.get("GITHUB_OUTPUT"):
         matrix = {"include": [
             {
@@ -373,12 +397,15 @@ def main() -> None:
         description="Validate, test, plan or preview releases, or release this action monorepo."
     )
     parser.add_argument(
-        "command", choices=("validate", "test", "changelog", "release-preview", "release"),
+        "command", choices=(
+            "validate", "test", "validate-changelog", "changelog", "release-preview", "release",
+        ),
     )
     args = parser.parse_args()
     try:
         {
-            "validate": validate, "test": test_actions, "changelog": changelog,
+            "validate": validate, "test": test_actions,
+            "validate-changelog": validate_changelog, "changelog": changelog,
             "release-preview": release_preview, "release": release,
         }[args.command](ROOT)
     except (ValueError, FileNotFoundError) as error:

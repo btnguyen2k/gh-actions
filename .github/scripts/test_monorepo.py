@@ -315,6 +315,7 @@ class ChangelogTests(RepositoryTestCase):
             "  #!example-action/v1.2.3": "expected #!",
             "#!Example/v1.2.3": "lowercase kebab-case",
             "#!example_action/v1.2.3": "lowercase kebab-case",
+            "#!*&^dummy": "lowercase kebab-case",
             "#!../v1.2.3": "lowercase kebab-case",
             "#!example-action/v1.2": "MAJOR.MINOR.PATCH",
             "#!example-action/v01.2.3": "MAJOR.MINOR.PATCH",
@@ -357,20 +358,117 @@ class ChangelogTests(RepositoryTestCase):
         ])
 
     def test_rejects_duplicate_and_conflicting_versions_instead_of_picking_one(self):
-        for header in (
-            "#!example-action/v1.2.3", "#!example-action/v1.2.4", "#!example-action",
+        for first, second in (
+            ("#!example-action/v1.2.3", "#!example-action/v1.2.3"),
+            ("#!example-action/v1.2.3", "#!example-action/v1.2.4"),
+            ("#!example-action/v1.2.3", "#!example-action"),
+            ("#!example-action", "#!example-action"),
         ):
-            with self.subTest(header=header):
-                sections, warnings = self.parse(
-                    "#!example-action/v1.2.3\n- First section\n"
-                    f"{header}\n- Second section\n"
-                    "#!second-action/v2.3.4\n- Valid section\n"
+            with self.subTest(first=first, second=second):
+                with self.assertRaisesRegex(monorepo.ChangelogError, (
+                    "Multiple release sections for action 'example-action' at lines 1, 3"
+                )):
+                    self.parse(
+                        f"{first}\n- First section\n{second}\n- Second section\n"
+                        "#!second-action/v2.3.4\n- Valid section\n"
+                    )
+
+    def test_duplicate_headers_fail_even_when_sections_are_empty(self):
+        for first_notes, second_notes in (
+            ("", "- Second update\n"),
+            ("- First update\n", ""),
+            ("# Comment only\n", "# Comment only\n"),
+        ):
+            with self.subTest(first_notes=first_notes, second_notes=second_notes):
+                with self.assertRaisesRegex(monorepo.ChangelogError, "Multiple release sections"):
+                    self.parse(
+                        f"#!example-action/v1.2.3\n{first_notes}"
+                        f"#!example-action/v1.2.4\n{second_notes}"
+                    )
+
+    def test_reports_every_action_with_duplicate_sections(self):
+        with self.assertRaises(monorepo.ChangelogError) as error:
+            self.parse(
+                "#!example-action\n- First\n#!second-action\n- First\n"
+                "#!example-action\n- Second\n#!second-action\n- Second\n"
+            )
+        self.assertIn("action 'example-action' at lines 1, 5", str(error.exception))
+        self.assertIn("action 'second-action' at lines 3, 7", str(error.exception))
+
+    def test_invalid_headers_do_not_count_as_duplicate_sections(self):
+        sections, warnings = self.parse(
+            "#!*&^dummy\n- Invalid name\n"
+            "#!example-action/vnot-semver\n- Invalid version\n"
+            "#!example-action\n- Valid update\n"
+        )
+        self.assertEqual(sections, [
+            monorepo.ReleaseSection("example-action", "", "- Valid update", 5),
+        ])
+        self.assertEqual([line for line, _ in warnings], [1, 3])
+
+    def test_validation_warns_and_ignores_invalid_sections_regardless_of_branch_scope(self):
+        self.write_changelog(
+            "#!example-action\n- First update\n#!*&^dummy\n- Invalid section\n"
+            "#!second-action/v1.2.3\n- Second update\n",
+            encoding="utf-8-sig",
+        )
+        output = io.StringIO()
+        with (
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "feature/second-action"}),
+            patch("sys.stdout", output),
+        ):
+            monorepo.validate_changelog(self.root)
+        self.assertIn("::warning file=.semrelease/this_release,line=3::", output.getvalue())
+        self.assertIn("#!*&^dummy", output.getvalue())
+        self.assertIn("Changelog validation passed (2 non-empty sections).", output.getvalue())
+        self.assertNotIn("- Invalid section", output.getvalue())
+
+    def test_validation_accepts_an_empty_or_cleaned_up_changelog(self):
+        for text in ("", "# Cleaned up\n"):
+            with self.subTest(text=text):
+                self.write_changelog(text)
+                output = io.StringIO()
+                with patch("sys.stdout", output):
+                    monorepo.validate_changelog(self.root)
+                self.assertEqual(
+                    output.getvalue(), "Changelog validation passed (0 non-empty sections).\n",
                 )
-                self.assertEqual(sections, [
-                    monorepo.ReleaseSection("second-action", "2.3.4", "- Valid section", 5),
-                ])
-                self.assertEqual([line for line, _ in warnings], [1, 3])
-                self.assertTrue(all("Multiple release sections" in message for _, message in warnings))
+
+    def test_validation_command_reports_warnings_and_fails_duplicates_outside_branch_scope(self):
+        self.write_changelog(
+            "#!*&^dummy\n- Invalid section\n"
+            "#!example-action/v1.2.3\n- First\n#!example-action/v1.2.4\n- Second\n"
+        )
+        output, error = io.StringIO(), io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch("sys.argv", ["monorepo.py", "validate-changelog"]),
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "feature/second-action"}),
+            patch("sys.stdout", output),
+            patch("sys.stderr", error),
+            self.assertRaises(SystemExit) as result,
+        ):
+            monorepo.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("::warning file=.semrelease/this_release,line=1::", output.getvalue())
+        self.assertIn("#!*&^dummy", output.getvalue())
+        self.assertNotIn("validation passed", output.getvalue())
+        self.assertIn("action 'example-action' at lines 3, 5", error.getvalue())
+
+    def test_duplicate_sections_cannot_export_a_release_matrix(self):
+        for branch in ("main", "feature/example-action"):
+            with self.subTest(branch=branch):
+                github_output = self.root / "outputs.txt"
+                github_output.write_text("existing=value\n", encoding="utf-8")
+                with self.assertRaises(monorepo.ChangelogError):
+                    self.report(
+                        "#!example-action/v1.2.3\n- First\n"
+                        "#!example-action/v1.2.4\n- Second\n",
+                        branch, github_output=github_output,
+                    )
+                self.assertEqual(
+                    github_output.read_text(encoding="utf-8"), "existing=value\n",
+                )
 
     def test_action_scope_ignores_unrelated_notes_and_invalid_sections(self):
         sections, warnings = self.parse(
@@ -441,7 +539,7 @@ class ChangelogTests(RepositoryTestCase):
                 self.assertNotIn("- First notes", output)
                 self.assertNotIn("::warning", output)
 
-    def test_action_branches_warn_for_missing_empty_invalid_or_ambiguous_sections(self):
+    def test_action_branches_warn_for_missing_empty_or_invalid_sections(self):
         for text in (
             "",
             "# Cleaned up\n",
@@ -449,7 +547,6 @@ class ChangelogTests(RepositoryTestCase):
             "#!example-action/v1.2.3\n# No notes\n",
             "#!example-action\n# No notes\n",
             "#!example-action/v01.2.3\n- Invalid version\n",
-            "#!example-action/v1.2.3\n- First\n#!example-action/v1.2.4\n- Second\n",
         ):
             for prefix in ("release", "dev", "feature", "custom_prefix.123"):
                 with self.subTest(text=text, prefix=prefix):
@@ -677,6 +774,17 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         )
         self.plan = self.workflow["jobs"]["ParseChangelog"]
         self.preview = self.workflow["jobs"]["PreviewRelease"]
+
+    def test_validates_the_whole_changelog_before_branch_scoped_release_planning(self):
+        steps = self.plan["steps"]
+        validator = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-changelog"
+        )
+        parser = next(step for step in steps if step.get("id") == "changelog")
+        self.assertLess(steps.index(validator), steps.index(parser))
+        self.assertNotIn("if", validator)
+        self.assertNotIn("continue-on-error", validator)
 
     def test_connects_branch_scoped_matrix_and_skips_empty_or_deleted_refs(self):
         self.assertEqual(self.plan["outputs"], {

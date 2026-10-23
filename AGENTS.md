@@ -67,9 +67,11 @@
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps.
 - CI's `ParseChangelog` job reports pending action releases and exports their
-  inputs as a matrix. On `<prefix>/<action>` branches with any non-empty prefix,
-  inspect only that action; branches without such a prefix inspect all actions.
-  Pull requests use their target/base branch for this scope.
+  inputs as a matrix. First validate the whole changelog with
+  `python .github\scripts\monorepo.py validate-changelog`, regardless of branch
+  scope. Then, on `<prefix>/<action>` branches with any non-empty prefix, inspect
+  only that action; branches without such a prefix inspect all actions. Pull
+  requests use their target/base branch for this scope.
 - CI's `PreviewRelease` job invokes pinned `btnguyen2k/action-semrelease` in
   read-only dry-run mode for each selected section. Capture `result`,
   `releaseVersion`, and `releaseNotes` in each matrix job's logs and summary, not
@@ -101,11 +103,14 @@
   repository-wide `#!VERSION` directives. Blank lines and ordinary `#` comment
   lines do not count as changelog entries.
 - Changelog reporting warns and excludes malformed headers, invalid action names
-  or stable versions, unknown actions, empty sections, and multiple non-empty
-  sections for one action. An action-scoped branch with no valid matching section
-  also warns. These warnings do not fail the parser; unreadable
-  or missing files do. An empty plan skips release previews; action-semrelease
-  failures still fail CI, and `SKIPPED` remains distinct from `SUCCESS`.
+  or stable versions, unknown actions, and empty sections. An action-scoped branch
+  with no valid matching section also warns. These warnings do not fail validation.
+- Each known action may have at most one valid section header, including when its
+  body is empty. Duplicate headers fail changelog validation with the action name
+  and source line numbers, whether their versions match, differ, or are omitted.
+  Missing or unreadable changelog files also fail. An empty plan skips release
+  previews; action-semrelease failures still fail CI, and `SKIPPED` remains distinct
+  from `SUCCESS`.
 - Actions are versioned independently. Full release tags are
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable
