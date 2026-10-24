@@ -2,10 +2,27 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: ["**", "!release/**"]
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      target-sha:
+        description: Immutable commit to validate
+        type: string
+        default: ""
+      target-branch:
+        description: Branch used to select the pending action
+        type: string
+        default: ""
+      skip-release-preview:
+        description: Let the release workflow calculate only after CI succeeds
+        type: boolean
+        default: false
+    outputs:
+      target-sha:
+        description: Commit actually selected for validation
+        value: ${{ jobs.CaptureContext.outputs.target-sha }}
 
 permissions:
   contents: read
@@ -20,20 +37,23 @@ jobs:
     timeout-minutes: 5
     outputs:
       target-sha: ${{ steps.context.outputs.target-sha }}
-      action-target-branch: ${{ steps.context.outputs.action-target-branch }}
+      action-target-branch: ${{ inputs.target-branch || steps.context.outputs.action-target-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.target-sha || github.sha }}
           persist-credentials: false
       - name: Capture workflow context
         id: context
         uses: ./workflow-context
+        with:
+          target-sha: ${{ inputs.target-sha }}
       - name: Print workflow context
         env:
           EVENT_NAME: ${{ steps.context.outputs.event-name }}
           TARGET_SHA: ${{ steps.context.outputs.target-sha }}
-          TARGET_BRANCH: ${{ steps.context.outputs.action-target-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch || steps.context.outputs.action-target-branch }}
           PR_NUMBER: ${{ steps.context.outputs.pr-number }}
         run: |
           printf 'Event: %s\n' "$EVENT_NAME"
@@ -64,13 +84,13 @@ jobs:
       - name: Report pending releases
         id: changelog
         env:
-          CHANGELOG_BRANCH: ${{ github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
+          CHANGELOG_BRANCH: ${{ inputs.target-branch || github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
         run: python .github/scripts/monorepo.py changelog
 
   PreviewRelease:
     name: Preview release (action - ${{ matrix.action }})
     needs: [CaptureContext, ParseChangelog]
-    if: ${{ needs.ParseChangelog.outputs.has-releases == 'true' && github.event.deleted != true }}
+    if: ${{ !inputs.skip-release-preview && needs.ParseChangelog.outputs.has-releases == 'true' && github.event.deleted != true }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ParseChangelog.outputs.matrix) }}

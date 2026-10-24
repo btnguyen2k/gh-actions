@@ -1,61 +1,215 @@
 name: Release
 
 on:
+  push:
+    branches: ["release/**"]
   workflow_dispatch:
     inputs:
       action:
-        description: Root-level action directory name
+        description: Action whose interrupted release should be resumed
         required: true
         type: string
-      version:
-        description: Stable SemVer without v (for example, 1.2.3)
-        required: true
-        type: string
-      notes:
-        description: Release notes for this action
+      run-id:
+        description: Original Release push run ID, or a recovery run with saved state
         required: true
         type: string
 
 permissions:
   contents: read
+  actions: read
+  pull-requests: read
+
+env:
+  PYTHON_VERSION: "3.12"
 
 concurrency:
-  group: release-${{ inputs.action }}
+  group: release-${{ github.event_name == 'push' && github.ref_name || format('release/{0}', inputs.action) }}
   cancel-in-progress: false
 
 jobs:
-  validate:
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-  publish:
-    name: Publish action release
-    needs: validate
+  CaptureContext:
+    name: Capture release context
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
+    timeout-minutes: 10
+    outputs:
+      eligible: ${{ steps.gate.outputs.eligible }}
+      action: ${{ steps.gate.outputs.action }}
+      branch: ${{ steps.gate.outputs.branch }}
+      merge-sha: ${{ steps.gate.outputs.merge-sha }}
+      source-run-id: ${{ steps.gate.outputs.source-run-id }}
+      source-pr: ${{ steps.gate.outputs.source-pr }}
+      trusted-sha: ${{ steps.gate.outputs.trusted-sha }}
+      run-ci: ${{ steps.gate.outputs.run-ci }}
+      ci-run-id: ${{ steps.gate.outputs.ci-run-id }}
+      ci-run-attempt: ${{ steps.gate.outputs.ci-run-attempt }}
+      ci-target-sha: ${{ steps.gate.outputs.ci-target-sha }}
     steps:
-      - name: Require the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            echo "::error::Releases must run from the repository's default branch."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout trusted automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
-      - name: Publish version and compatibility aliases
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Capture workflow context
+        id: context
+        uses: ./workflow-context
+      - name: Configure read-only Git access
         env:
-          ACTION_NAME: ${{ inputs.action }}
-          ACTION_VERSION: ${{ inputs.version }}
-          RELEASE_NOTES: ${{ inputs.notes }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
-        run: python .github/scripts/monorepo.py release
+        run: gh auth setup-git
+      - name: Verify release eligibility and recovery state
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CAPTURED_SHA: ${{ steps.context.outputs.target-sha }}
+          CAPTURED_BRANCH: ${{ steps.context.outputs.action-target-branch }}
+          RECOVERY_ACTION: ${{ inputs.action }}
+          RECOVERY_RUN_ID: ${{ inputs.run-id }}
+        run: python .github/scripts/release_workflow.py context
+
+  CI:
+    name: CI
+    needs: CaptureContext
+    if: ${{ needs.CaptureContext.outputs.eligible == 'true' && needs.CaptureContext.outputs.run-ci == 'true' }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      target-sha: ${{ needs.CaptureContext.outputs.merge-sha }}
+      target-branch: ${{ needs.CaptureContext.outputs.branch }}
+      skip-release-preview: true
+    permissions:
+      contents: read
+
+  Release:
+    name: Prepare, publish, and promote
+    needs: [CaptureContext, CI]
+    if: >-
+      ${{ !cancelled() && needs.CaptureContext.result == 'success'
+          && needs.CaptureContext.outputs.eligible == 'true'
+          && (needs.CI.result == 'success'
+              || (needs.CI.result == 'skipped' && needs.CaptureContext.outputs.run-ci == 'false')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      ACTION_NAME: ${{ needs.CaptureContext.outputs.action }}
+      RELEASE_BRANCH: ${{ needs.CaptureContext.outputs.branch }}
+      MERGE_SHA: ${{ needs.CaptureContext.outputs.merge-sha }}
+      SOURCE_RUN_ID: ${{ needs.CaptureContext.outputs.source-run-id }}
+      SOURCE_PR: ${{ needs.CaptureContext.outputs.source-pr }}
+    steps:
+      - name: Checkout trusted automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.CaptureContext.outputs.trusted-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Configure read-only Git access
+        run: gh auth setup-git
+      - name: Restore the latest release checkpoint
+        id: restore
+        run: python .github/scripts/release_workflow.py restore
+      - name: Save restored release plan
+        if: ${{ steps.restore.outputs.state-present == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-restored
+          path: release-state.json
+          archive: true
+          if-no-files-found: error
+      - name: Select the pinned action section
+        id: inputs
+        run: python .github/scripts/release_workflow.py inputs
+      - name: Calculate release version and notes
+        id: semrelease
+        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
+        uses: btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d # v5.1.0
+        with:
+          github-token: ${{ github.token }}
+          dry-run: true
+          target-sha: ${{ env.MERGE_SHA }}
+          branches: refs/heads/${{ env.RELEASE_BRANCH }}
+          tag-prefix: ${{ steps.inputs.outputs.tag-prefix }}
+          version: ${{ steps.inputs.outputs.version }}
+          change-log: ${{ fromJSON(steps.inputs.outputs.change-log-json) }}
+      - name: Validate and record the calculation
+        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
+        env:
+          RELEASE_RESULT: ${{ steps.semrelease.outputs.result }}
+          RELEASE_VERSION: ${{ steps.semrelease.outputs.releaseVersion }}
+          RELEASE_NOTES: ${{ steps.semrelease.outputs.releaseNotes }}
+          CI_RUN_ID: ${{ needs.CI.result == 'success' && github.run_id || needs.CaptureContext.outputs.ci-run-id }}
+          CI_RUN_ATTEMPT: ${{ needs.CI.result == 'success' && github.run_attempt || needs.CaptureContext.outputs.ci-run-attempt }}
+          CI_TARGET_SHA: ${{ needs.CI.outputs.target-sha || needs.CaptureContext.outputs.ci-target-sha }}
+        run: python .github/scripts/release_workflow.py calculate
+      - name: Save calculated release plan
+        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-calculated
+          path: release-state.json
+          archive: true
+          if-no-files-found: error
+      - name: Prepare the notes-only and cleanup commits
+        run: python .github/scripts/release_workflow.py prepare
+      - name: Save prepared release plan
+        if: ${{ steps.inputs.outputs.frozen != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-prepared
+          path: release-state.json
+          archive: true
+          if-no-files-found: error
+      - name: Require release automation credentials
+        env:
+          CLIENT_ID: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::Configure RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App."
+            exit 1
+          fi
+      - name: Create repository-scoped automation token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Commit the release-notes update
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python .github/scripts/release_workflow.py push-notes
+      - name: Verify the committed release plan
+        run: python .github/scripts/release_workflow.py freeze
+      - name: Freeze release plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-frozen
+          path: release-state.json
+          archive: true
+          if-no-files-found: error
+      - name: Publish immutable release and compatibility aliases
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python .github/scripts/release_workflow.py publish
+      - name: Clean only the published changelog section
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python .github/scripts/release_workflow.py cleanup
+      - name: Create or reuse the promotion PR for manual merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python .github/scripts/release_workflow.py promote

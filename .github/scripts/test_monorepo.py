@@ -803,11 +803,13 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         parser = next(step for step in self.plan["steps"] if step.get("id") == "changelog")
         self.assertEqual(parser["run"], "python .github/scripts/monorepo.py changelog")
         self.assertEqual(parser["env"]["CHANGELOG_BRANCH"], (
-            "${{ github.base_ref || needs.CaptureContext.outputs.action-target-branch }}"
+            "${{ inputs.target-branch || github.base_ref || "
+            "needs.CaptureContext.outputs.action-target-branch }}"
         ))
         self.assertEqual(self.preview["needs"], ["CaptureContext", "ParseChangelog"])
         self.assertEqual(self.preview["if"], (
-            "${{ needs.ParseChangelog.outputs.has-releases == 'true' "
+            "${{ !inputs.skip-release-preview && "
+            "needs.ParseChangelog.outputs.has-releases == 'true' "
             "&& github.event.deleted != true }}"
         ))
         self.assertEqual(self.preview["strategy"], {
