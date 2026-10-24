@@ -21,6 +21,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
+  PYTHONIOENCODING: "utf-8"
 
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || format('release/{0}', inputs.action) }}
@@ -175,7 +176,7 @@ jobs:
           PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
         run: |
           if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
-            echo "::error::Configure RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App."
+            echo "::error::❌ Configure RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App."
             exit 1
           fi
       - name: Create repository-scoped automation token

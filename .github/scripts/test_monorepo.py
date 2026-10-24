@@ -26,6 +26,75 @@ class RepositoryTestCase(unittest.TestCase):
         return directory
 
 
+class ConsoleOutputTests(RepositoryTestCase):
+    def test_configures_utf8_without_changing_stream_error_handling(self):
+        stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="ascii", errors="strict", newline="\n")
+        stderr = io.TextIOWrapper(
+            stderr_bytes, encoding="ascii", errors="backslashreplace", newline="\n",
+        )
+        self.addCleanup(stdout.close)
+        self.addCleanup(stderr.close)
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            monorepo.configure_output()
+            print("ℹ️ Information")
+            print("❌ Error", file=sys.stderr)
+        stdout.flush()
+        stderr.flush()
+        self.assertEqual(stdout_bytes.getvalue(), "ℹ️ Information\n".encode("utf-8"))
+        self.assertEqual(stderr_bytes.getvalue(), "❌ Error\n".encode("utf-8"))
+        self.assertEqual(stdout.errors, "strict")
+        self.assertEqual(stderr.errors, "backslashreplace")
+
+    def test_supports_in_memory_output_capture(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            monorepo.configure_output()
+            print("✅ Success")
+        self.assertEqual(stdout.getvalue(), "✅ Success\n")
+
+    def test_warning_icon_preserves_annotation_metadata_and_escaping(self):
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            monorepo.print_changelog_warnings([(7, "Invalid%\nsection\r")])
+        self.assertEqual(
+            output.getvalue(),
+            "::warning file=.semrelease/this_release,line=7::⚠️ Invalid%25%0Asection%0D\n",
+        )
+
+    def test_cli_emits_utf8_messages_with_ascii_stdio_defaults(self):
+        self.add_action()
+        changelog = self.root / ".semrelease" / "this_release"
+        changelog.parent.mkdir()
+        changelog.write_text(
+            "#!example-action\n- feat(action): test output\n#!bad%name\n- Ignored\n",
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable, "-c",
+            "import sys; from pathlib import Path; import monorepo; "
+            "monorepo.ROOT = Path(sys.argv[1]); "
+            "sys.argv = ['monorepo.py', 'validate-changelog']; monorepo.main()",
+            str(self.root),
+        ]
+        environment = {**os.environ, "PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"}
+        result = subprocess.run(
+            command, cwd=Path(monorepo.__file__).parent, env=environment,
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        output = result.stdout.decode("utf-8")
+        self.assertIn("::warning file=.semrelease/this_release,line=3::⚠️ ", output)
+        self.assertIn("✅ Changelog validation passed", output)
+        changelog.unlink()
+        result = subprocess.run(
+            command, cwd=Path(monorepo.__file__).parent, env=environment,
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.decode("utf-8").startswith("❌ error:"))
+
+
 class ActionLayoutTests(RepositoryTestCase):
     def test_empty_repository_has_no_actions(self):
         (self.root / ".github").mkdir()
@@ -163,12 +232,12 @@ class ActionLayoutTests(RepositoryTestCase):
             "vendor.github-workflows", "vendor.dependabot", "vendor.github-actions",
         ])
         groups = [
-            "Validating github-workflows:\n"
+            "ℹ️ Validating github-workflows:\n"
             "  - .github/workflows/ci.yml\n"
             "  - .github/workflows/release.yaml\n",
-            "Validating dependabot:\n"
+            "ℹ️ Validating dependabot:\n"
             "  - .github/dependabot.yml\n",
-            "Validating github-actions:\n"
+            "ℹ️ Validating github-actions:\n"
             "  - example-action/action.yml\n"
             "  - second-action/action.yml\n",
         ]
@@ -191,7 +260,7 @@ class ActionLayoutTests(RepositoryTestCase):
         self.assertIs(result.exception, failure)
         run.assert_called_once()
         self.assertEqual(
-            output.getvalue(), "Validating github-workflows:\n  - .github/workflows/ci.yml\n",
+            output.getvalue(), "ℹ️ Validating github-workflows:\n  - .github/workflows/ci.yml\n",
         )
 
     def test_action_schema_accepts_supported_runtimes_and_rejects_missing_runs(self):
@@ -440,7 +509,7 @@ class ChangelogTests(RepositoryTestCase):
                 with patch("sys.stdout", output):
                     monorepo.validate_changelog(self.root)
                 self.assertEqual(
-                    output.getvalue(), "Changelog validation passed (0 non-empty sections).\n",
+                    output.getvalue(), "✅ Changelog validation passed (0 non-empty sections).\n",
                 )
 
     def test_validation_command_reports_warnings_and_fails_duplicates_outside_branch_scope(self):
@@ -562,7 +631,7 @@ class ChangelogTests(RepositoryTestCase):
                     output = self.report(text, f"{prefix}/example-action")
                     self.assertIn("Pending releases: 0\n", output)
                     self.assertIn(
-                        "::warning file=.semrelease/this_release,line=1::"
+                        "::warning file=.semrelease/this_release,line=1::⚠️ "
                         "No valid, non-empty release sections found for action 'example-action'",
                         output,
                     )
@@ -723,12 +792,12 @@ class ReleasePreviewTests(RepositoryTestCase):
         with patch("sys.stdout", output):
             monorepo.release_preview(self.root)
         self.assertIn(
-            "Action: example-action\nresult: SUCCESS\nreleaseVersion: 1.2.3\n"
+            "✅ Action: example-action\nresult: SUCCESS\nreleaseVersion: 1.2.3\n"
             "releaseNotes:\n## Features\n\n- feat(action): add capability\n",
             output.getvalue(),
         )
         self.assertEqual(summary.read_text(encoding="utf-8"), (
-            "Existing summary\n\n## Release preview: `example-action`\n\n"
+            "Existing summary\n\n## ✅ Release preview: `example-action`\n\n"
             "- result: `SUCCESS`\n- releaseVersion: `1.2.3`\n\n"
             "### releaseNotes\n\n## Features\n\n- feat(action): add capability\n\n\n"
         ))
@@ -738,6 +807,7 @@ class ReleasePreviewTests(RepositoryTestCase):
         output = io.StringIO()
         with patch("sys.stdout", output):
             monorepo.release_preview(self.root)
+        self.assertIn("ℹ️ Action: example-action\n", output.getvalue())
         self.assertIn("result: SKIPPED\nreleaseVersion: \nreleaseNotes:\n", output.getvalue())
 
     def test_failed_result_is_reported_and_remains_a_failure(self):
@@ -745,6 +815,7 @@ class ReleasePreviewTests(RepositoryTestCase):
         output = io.StringIO()
         with patch("sys.stdout", output), self.assertRaisesRegex(ValueError, "preview.*failed"):
             monorepo.release_preview(self.root)
+        self.assertIn("❌ Action: example-action\n", output.getvalue())
         self.assertIn("result: FAILED\n", output.getvalue())
 
     def test_rejects_missing_unknown_or_incomplete_outputs(self):
@@ -877,7 +948,7 @@ class CIMarkerWorkflowTests(unittest.TestCase):
                 self.jobs[name]["steps"][0]["run"],
             ],
             cwd=monorepo.ROOT, env={**os.environ, **environment},
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True, encoding="utf-8", check=False, timeout=10,
         )
 
     def test_marker_jobs_have_stable_names_and_run_after_failed_dependencies(self):
@@ -920,7 +991,9 @@ class CIMarkerWorkflowTests(unittest.TestCase):
                     result.returncode == 0, status == "success", result.stdout + result.stderr,
                 )
                 if status != "success":
-                    self.assertIn("::error::Validate", result.stdout)
+                    self.assertIn("::error::❌ Validate", result.stdout)
+                else:
+                    self.assertIn("✅ All validation jobs passed.", result.stdout)
 
     def test_preview_marker_requires_successful_planning_and_success_or_intentional_skip(self):
         statuses = ("success", "failure", "cancelled", "skipped", "")
@@ -940,9 +1013,11 @@ class CIMarkerWorkflowTests(unittest.TestCase):
                             result.returncode == 0, expected, result.stdout + result.stderr,
                         )
                         if not expected:
-                            self.assertIn("::error::", result.stdout)
+                            self.assertIn("::error::❌ ", result.stdout)
                         elif preview == "skipped":
-                            self.assertIn("intentionally skipped", result.stdout)
+                            self.assertIn("ℹ️ Release preview was intentionally skipped.", result.stdout)
+                        else:
+                            self.assertIn("✅ All release previews passed.", result.stdout)
 
 
 class ReleaseCommandTests(RepositoryTestCase):

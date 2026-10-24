@@ -675,6 +675,7 @@ class ArtifactTests(ReleaseFixture):
                         release.main()
         self.assertEqual(exit_code.exception.code, 1)
         text = output.getvalue()
+        self.assertIn("❌ Release workflow failed: Network failed", text)
         self.assertIn("Network failed\n::warning::literal", text)
         self.assertLess(text.index("::stop-commands::"), text.index("Network failed"))
 
@@ -689,6 +690,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.jobs = self.workflow["jobs"]
         self.steps = self.jobs["Release"]["steps"]
         self.named = {step.get("name"): step for step in self.steps}
+
+    def test_python_workflows_use_utf8_for_console_messages(self):
+        for workflow in (self.workflow, self.ci):
+            with self.subTest(name=workflow["name"]):
+                self.assertEqual(workflow["env"]["PYTHONIOENCODING"], "utf-8")
 
     def test_release_trigger_recovery_and_concurrency_are_action_scoped(self):
         self.assertEqual(self.workflow["on"]["push"]["branches"], ["release/**"])

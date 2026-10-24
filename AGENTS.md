@@ -37,6 +37,11 @@
   secrets; use least-privilege tokens and explicit, actionable failures.
 - Write outputs through GitHub's supported output mechanism, such as
   `$GITHUB_OUTPUT`, and preserve the documented output format.
+- Prefix human-readable workflow/script messages with ℹ️ for information, ✅ for
+  success, ⚠️ for warnings, and ❌ for errors. Keep annotation commands, required
+  check names, machine-readable outputs, and release-note content unchanged.
+  Python CLIs configure UTF-8 output, and Python workflows set
+  `PYTHONIOENCODING: "utf-8"`; decode captured log output as UTF-8 on Windows too.
 
 ## Validation
 

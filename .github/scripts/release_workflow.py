@@ -433,12 +433,12 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
         payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
         branch = os.environ["CAPTURED_BRANCH"]
         if any(payload.get(name) is True for name in ("created", "deleted", "forced")):
-            print("Not a release cycle: branch creation, deletion, or forced push.")
+            print("ℹ️ Not a release cycle: branch creation, deletion, or forced push.")
             emit(eligible=False)
             return
         action = branch.removeprefix("release/")
         if branch != f"release/{action}" or not monorepo.ACTION_NAME.fullmatch(action):
-            print("Not a release cycle: expected release/<action>.")
+            print("ℹ️ Not a release cycle: expected release/<action>.")
             emit(eligible=False)
             return
         merge_sha = os.environ["CAPTURED_SHA"]
@@ -452,7 +452,7 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
             if matching_merge(pr, Cycle(client.repository, action, branch, merge_sha, current_run, 1, default))
         ]
         if not matching:
-            print("Not a release cycle: this push is not a verified PR merge.")
+            print("ℹ️ Not a release cycle: this push is not a verified PR merge.")
             emit(eligible=False)
             return
         if len(matching) != 1:
@@ -742,7 +742,7 @@ def prepare(root: Path, _client: GitHub, path: Path) -> None:
     if plan.stage != "calculated" and replace(prepared, stage=plan.stage) != plan:
         raise ValueError("Reconstructed preparation does not match the saved commits.")
     save(path, replace(prepared, stage=plan.stage) if plan.stage == "frozen" else prepared)
-    print(f"Prepared {plan.tag}: merge {plan.cycle.merge_sha}, release {release_sha}.")
+    print(f"✅ Prepared {plan.tag}: merge {plan.cycle.merge_sha}, release {release_sha}.")
 
 
 def remote_head(root: Path, branch: str) -> str:
@@ -803,10 +803,10 @@ def push_notes(root: Path, client: GitHub, path: Path) -> None:
         return
     head = remote_head(root, plan.cycle.branch)
     if head == plan.release_sha:
-        print("Release-notes entry is already committed; skipping the update.")
+        print("ℹ️ Release-notes entry is already committed; skipping the update.")
     elif head == plan.cleanup_sha:
         require_published(root, client, plan)
-        print("Publication and cleanup already completed; reusing the recorded release.")
+        print("ℹ️ Publication and cleanup already completed; reusing the recorded release.")
     elif head == plan.cycle.merge_sha:
         if plan.stage == "frozen":
             raise ValueError("A frozen release branch was rewound; reconcile it manually.")
@@ -861,7 +861,7 @@ def publish(root: Path, client: GitHub, path: Path) -> None:
             "tag_name": plan.tag, "target_commitish": plan.release_sha, "name": plan.tag,
             "body": plan.release_notes, "draft": False, "prerelease": False, "make_latest": "false",
         })
-    print(existing["html_url"])
+    print(f"✅ Release: {existing['html_url']}")
 
 
 def cleanup(root: Path, client: GitHub, path: Path) -> None:
@@ -872,7 +872,7 @@ def cleanup(root: Path, client: GitHub, path: Path) -> None:
         return
     head = remote_head(root, plan.cycle.branch)
     if head == plan.cleanup_sha:
-        print("Matching changelog cleanup is already committed.")
+        print("ℹ️ Matching changelog cleanup is already committed.")
     elif head == plan.release_sha:
         push_branch(root, plan.cycle.branch, head, plan.cleanup_sha)
     else:
@@ -907,11 +907,11 @@ def promote(root: Path, client: GitHub, path: Path) -> None:
             raise ValueError("Promotion branch moved while the PR was being created.")
     elif pr["state"] != "open" and pr["merged_at"] is None:
         raise ValueError("The promotion PR was closed without merging; reopen it manually.")
-    print(f"Promotion PR: {pr['html_url']}")
+    print(f"ℹ️ Promotion PR: {pr['html_url']}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary).open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(
-                f"## Release `{plan.tag}`\n\n"
+                f"## ✅ Release `{plan.tag}`\n\n"
                 f"CI-tested SHA: `{plan.cycle.merge_sha}`  \n"
                 f"Release SHA: `{plan.release_sha}`\n\n"
                 f"Promotion: {pr['html_url']}\n\n"
@@ -920,6 +920,7 @@ def promote(root: Path, client: GitHub, path: Path) -> None:
 
 
 def main() -> None:
+    monorepo.configure_output()
     commands = {
         "context": context, "restore": restore, "inputs": inputs, "calculate": calculate,
         "prepare": prepare, "push-notes": push_notes, "freeze": freeze, "publish": publish,
@@ -940,7 +941,7 @@ def main() -> None:
                 detail = detail.decode("utf-8", errors="replace")
         else:
             detail = str(error)
-        monorepo.print_workflow_data(f"Release workflow failed: {detail}")
+        monorepo.print_workflow_data(f"❌ Release workflow failed: {detail}")
         parser.exit(1)
 
 
