@@ -28,6 +28,7 @@ class FakeGitHub:
         self.source_pr = {
             "number": cycle.source_pr, "merged_at": "2026-01-01T00:00:00Z",
             "merge_commit_sha": cycle.merge_sha,
+            "head": {"ref": f"dev/{cycle.action}"},
             "base": {"ref": cycle.branch, "repo": {"full_name": cycle.repository}},
         }
         self.jobs = {
@@ -319,6 +320,39 @@ class ContextTests(ReleaseFixture):
         self.assertEqual(values["merge_sha"], self.merge)
         self.assertEqual(values["source_pr"], 7)
         self.assertEqual(values["trusted_sha"], self.merge)
+
+    def test_merged_pr_routing_errors_fail_before_ci_or_publication(self):
+        for source in ("dev/other", "main"):
+            self.client.source_pr["head"]["ref"] = source
+            with (
+                self.subTest(source=source),
+                patch("release_workflow.emit") as emit,
+                self.assertRaisesRegex(ValueError, "PR action mismatch|must use <prefix>/dummy"),
+            ):
+                release.context(self.root, self.client, self.path)
+            emit.assert_not_called()
+            self.assertEqual(self.client.writes, [])
+            self.assertFalse(self.path.exists())
+            self.assertEqual(release.remote_head(self.root, self.cycle.branch), self.merge)
+
+    def test_manual_recovery_cannot_bypass_pr_branch_pairing(self):
+        plan = self.calculate()
+        self.client.checkpoint(plan)
+        environment = {
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
+            "RECOVERY_ACTION": "dummy", "RECOVERY_RUN_ID": "17",
+        }
+        for source in ("dev/other", "main"):
+            self.client.source_pr["head"]["ref"] = source
+            with (
+                self.subTest(source=source),
+                patch.dict(os.environ, environment),
+                self.assertRaisesRegex(ValueError, "PR action mismatch|must use <prefix>/dummy"),
+            ):
+                release.context(self.root, self.client, self.path)
+            self.assertEqual(release.load(self.path, self.cycle), plan)
+            self.assertEqual(self.client.writes, [])
+            self.assertEqual(release.remote_head(self.root, self.cycle.branch), self.merge)
 
     def test_branch_creation_deletion_forced_or_direct_push_is_not_a_release(self):
         event = Path(self.environment["GITHUB_EVENT_PATH"])

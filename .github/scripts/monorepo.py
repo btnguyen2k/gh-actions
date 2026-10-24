@@ -24,6 +24,46 @@ def validate_name(name: str) -> None:
         raise ValueError("Action names must use lowercase kebab-case.")
 
 
+def validate_release_pr_branches(source_branch: str, target_branch: str) -> bool:
+    if (
+        not isinstance(source_branch, str) or not source_branch
+        or not isinstance(target_branch, str) or not target_branch
+    ):
+        raise ValueError("PR source and target branches must be nonempty strings.")
+    if not target_branch.startswith("release/"):
+        return False
+    target_action = target_branch.removeprefix("release/")
+    if not ACTION_NAME.fullmatch(target_action):
+        raise ValueError(
+            f"Invalid release PR target branch {target_branch!r}; "
+            "expected release/<action> with a lowercase kebab-case action name."
+        )
+    prefix, separator, source_action = source_branch.partition("/")
+    if not prefix or not separator or not ACTION_NAME.fullmatch(source_action):
+        raise ValueError(
+            f"PR source branch {source_branch!r} must use <prefix>/{target_action} "
+            f"when targeting {target_branch!r}."
+        )
+    if source_action != target_action:
+        raise ValueError(
+            f"PR action mismatch: {source_branch!r} targets {target_branch!r}; "
+            "both must name the same action."
+        )
+    return True
+
+
+def validate_pr_branches(_root: Path) -> None:
+    required = ("PR_HEAD_REF", "PR_BASE_REF")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise ValueError(f"Missing PR branch environment variables: {', '.join(missing)}.")
+    source, target = (os.environ[name] for name in required)
+    if validate_release_pr_branches(source, target):
+        print(f"✅ Release PR branches match: {source!r} -> {target!r}.", flush=True)
+    else:
+        print(f"ℹ️ PR target {target!r} is not a release branch; branch pairing check skipped.", flush=True)
+
+
 def parse_version(value: str) -> tuple[int, int, int]:
     match = VERSION.fullmatch(value)
     if not match:
@@ -406,13 +446,15 @@ def main() -> None:
     )
     parser.add_argument(
         "command", choices=(
-            "validate", "test", "validate-changelog", "changelog", "release-preview", "release",
+            "validate", "test", "validate-pr-branches", "validate-changelog", "changelog",
+            "release-preview", "release",
         ),
     )
     args = parser.parse_args()
     try:
         {
             "validate": validate, "test": test_actions,
+            "validate-pr-branches": validate_pr_branches,
             "validate-changelog": validate_changelog, "changelog": changelog,
             "release-preview": release_preview, "release": release,
         }[args.command](ROOT)

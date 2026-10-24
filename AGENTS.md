@@ -72,6 +72,13 @@
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps. Reusable CI accepts `target-sha` and
   `target-branch`; use the explicit SHA rather than a moving branch.
+- PRs targeting `release/<action>` must originate from `<prefix>/<same-action>`,
+  using any non-empty first path component as the prefix. Reject mismatched
+  actions, unscoped sources such as `main`, and nested or malformed action suffixes.
+  Other PR targets, including promotion into `main`, are unaffected.
+  `ParseChangelog` runs `python .github\scripts\monorepo.py validate-pr-branches`
+  with `PR_HEAD_REF` and `PR_BASE_REF` before changelog validation/planning.
+  PR `edited` events rerun CI so retargeting cannot reuse the previous routing check.
 - CI's `ParseChangelog` job reports pending action releases and exports their
   inputs as a matrix. First validate the whole changelog with
   `python .github\scripts\monorepo.py validate-changelog`, regardless of branch
@@ -140,6 +147,9 @@
   direct pushes, and generated notes/cleanup pushes do not start release cycles.
   Verify the merged PR's base branch and merge SHA; do not infer a merge from its
   commit message.
+- Trusted release verification rechecks the same source/target action pairing
+  from the merged PR's API metadata for new cycles and recovery. A mismatch is an
+  explicit error before CI/publication, not an ignored direct push.
 - Capture context with `workflow-context`, pin the original merge SHA R, and run
   native CI on R before calculating version/notes. Require `SUCCESS`, a bare
   stable version matching any fixed header, nonempty generated notes, and actual

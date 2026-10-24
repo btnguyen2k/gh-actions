@@ -95,6 +95,117 @@ class ConsoleOutputTests(RepositoryTestCase):
         self.assertTrue(result.stderr.decode("utf-8").startswith("❌ error:"))
 
 
+class ReleaseBranchTests(RepositoryTestCase):
+    def test_accepts_matching_action_with_any_nonempty_prefix(self):
+        for prefix in ("dev", "feature", "hotfix", "release", "custom_prefix.123"):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(monorepo.validate_release_pr_branches(
+                    f"{prefix}/example-action", "release/example-action",
+                ))
+
+    def test_non_release_targets_including_promotion_remain_unrestricted(self):
+        for source, target in (
+            ("release/example-action", "main"),
+            ("main", "dev/example-action"),
+            ("feature/general-cleanup", "main"),
+            ("dependabot/github_actions/checkout", "main"),
+            ("dev/example-action", "dev/second-action"),
+            ("dev/example-action", "release"),
+        ):
+            with self.subTest(source=source, target=target):
+                self.assertFalse(monorepo.validate_release_pr_branches(source, target))
+
+    def test_rejects_mismatched_action_names(self):
+        with self.assertRaisesRegex(ValueError, "PR action mismatch") as error:
+            monorepo.validate_release_pr_branches(
+                "dev/example-action", "release/second-action",
+            )
+        self.assertIn("dev/example-action", str(error.exception))
+        self.assertIn("release/second-action", str(error.exception))
+
+    def test_rejects_unscoped_or_malformed_release_sources(self):
+        for source in (
+            "main", "example-action", "/example-action", "dev/",
+            "feature/nested/example-action", "dev/Example-action", "dev/example_action",
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                ValueError, "must use <prefix>/example-action",
+            ):
+                monorepo.validate_release_pr_branches(source, "release/example-action")
+
+    def test_rejects_malformed_release_targets(self):
+        for target in (
+            "release/", "release/Example-action", "release/example_action",
+            "release/example-action/nested",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                ValueError, "Invalid release PR target branch",
+            ):
+                monorepo.validate_release_pr_branches("dev/example-action", target)
+
+    def test_rejects_missing_or_nontext_branch_metadata(self):
+        for source, target in (
+            ("", "release/example-action"), ("dev/example-action", ""),
+            (None, "release/example-action"), ("dev/example-action", None),
+            (True, "release/example-action"), ("dev/example-action", 1),
+        ):
+            with self.subTest(source=source, target=target), self.assertRaisesRegex(
+                ValueError, "nonempty strings",
+            ):
+                monorepo.validate_release_pr_branches(source, target)
+
+    def test_cli_reports_matching_release_branches_and_non_release_targets(self):
+        for source, target, message in (
+            ("feature/example-action", "release/example-action", "✅ Release PR branches match"),
+            ("release/example-action", "main", "ℹ️ PR target 'main' is not a release branch"),
+        ):
+            output = io.StringIO()
+            with (
+                self.subTest(source=source, target=target),
+                patch.dict(os.environ, {"PR_HEAD_REF": source, "PR_BASE_REF": target}),
+                patch("sys.argv", ["monorepo.py", "validate-pr-branches"]),
+                patch("sys.stdout", output),
+            ):
+                self.assertIsNone(monorepo.main())
+            self.assertIn(message, output.getvalue())
+
+    def test_cli_rejects_mismatch_before_exporting_any_plan_even_with_both_sections(self):
+        self.add_action()
+        self.add_action("second-action")
+        changelog = self.root / ".semrelease" / "this_release"
+        changelog.parent.mkdir()
+        content = "#!example-action\n- First update\n#!second-action\n- Second update\n"
+        changelog.write_text(content, encoding="utf-8", newline="\n")
+        github_output = self.root / "outputs.txt"
+        github_output.write_text("existing=value\n", encoding="utf-8", newline="\n")
+        output, error = io.StringIO(), io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch.dict(os.environ, {
+                "PR_HEAD_REF": "dev/example-action", "PR_BASE_REF": "release/second-action",
+                "GITHUB_OUTPUT": str(github_output),
+            }),
+            patch("sys.argv", ["monorepo.py", "validate-pr-branches"]),
+            patch("sys.stdout", output), patch("sys.stderr", error),
+            self.assertRaises(SystemExit) as result,
+        ):
+            monorepo.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("❌ error: PR action mismatch", error.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(changelog.read_text(encoding="utf-8"), content)
+        self.assertEqual(github_output.read_text(encoding="utf-8"), "existing=value\n")
+
+    def test_cli_requires_explicit_pr_branch_metadata(self):
+        for environment in ({}, {"PR_HEAD_REF": "dev/example-action"}, {"PR_BASE_REF": "main"}):
+            with (
+                self.subTest(environment=environment),
+                patch.dict(os.environ, environment, clear=True),
+                self.assertRaisesRegex(ValueError, "Missing PR branch environment variables"),
+            ):
+                monorepo.validate_pr_branches(self.root)
+
+
 class ActionLayoutTests(RepositoryTestCase):
     def test_empty_repository_has_no_actions(self):
         (self.root / ".github").mkdir()
@@ -854,6 +965,30 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         )
         self.plan = self.workflow["jobs"]["ParseChangelog"]
         self.preview = self.workflow["jobs"]["PreviewRelease"]
+
+    def test_pr_retargeting_reruns_ci_and_pairing_is_checked_before_changelog_planning(self):
+        self.assertEqual(
+            self.workflow["on"]["pull_request"]["types"],
+            ["opened", "synchronize", "reopened", "edited"],
+        )
+        steps = self.plan["steps"]
+        setup = next(step for step in steps if step.get("name") == "Set up Python")
+        pairing = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-pr-branches"
+        )
+        validator = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-changelog"
+        )
+        self.assertLess(steps.index(setup), steps.index(pairing))
+        self.assertLess(steps.index(pairing), steps.index(validator))
+        self.assertEqual(pairing["if"], "${{ github.event_name == 'pull_request' }}")
+        self.assertEqual(pairing["env"], {
+            "PR_HEAD_REF": "${{ github.head_ref }}",
+            "PR_BASE_REF": "${{ github.base_ref }}",
+        })
+        self.assertNotIn("continue-on-error", pairing)
 
     def test_validates_the_whole_changelog_before_branch_scoped_release_planning(self):
         steps = self.plan["steps"]

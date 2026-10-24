@@ -305,6 +305,7 @@ def verify_source(client: GitHub, cycle: Cycle) -> None:
     pr = client.api(f"repos/{cycle.repository}/pulls/{cycle.source_pr}")
     if not matching_merge(pr, cycle):
         raise ValueError("The pinned release SHA is not the verified PR merge.")
+    monorepo.validate_release_pr_branches(pr["head"]["ref"], pr["base"]["ref"])
 
 
 def ci_evidence(client: GitHub, run_id: int, attempt: int):
