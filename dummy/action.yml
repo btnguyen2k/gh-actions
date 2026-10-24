@@ -1,0 +1,9 @@
+name: Dummy
+description: Internal testing-only action that prints a message and performs no meaningful work.
+runs:
+  using: composite
+  steps:
+    - name: Print testing-only message
+      shell: bash
+      run: |
+        "$BASH" "$GITHUB_ACTION_PATH/main.sh"

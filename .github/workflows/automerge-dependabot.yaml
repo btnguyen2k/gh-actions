@@ -25,25 +25,25 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             if (!context.payload.pull_request && (!context.payload.workflow_run.pull_requests || context.payload.workflow_run.pull_requests.length === 0)) {
-              console.log('Not Merged 🚫');
-              console.log('No pull_request found in payload.');
+              console.log('ℹ️ Not merged.');
+              console.log('ℹ️ No pull_request found in payload.');
               return;
             }
             const pr_number = context.payload.pull_request ? context.payload.pull_request.number : context.payload.workflow_run.pull_requests[0].number
-            console.log(`Merging PR <${pr_number}>... 🕜`);
+            console.log(`ℹ️ Merging PR <${pr_number}>...`);
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: pr_number,
             });
             if (pr.data.user.login !== 'dependabot[bot]') {
-              console.log('Not Merged 🚫');
-              console.log(`User <${pr.data.user.login}> does not equal <dependabot[bot]>`);
+              console.log('ℹ️ Not merged.');
+              console.log(`ℹ️ User <${pr.data.user.login}> does not equal <dependabot[bot]>`);
             } else {
               await github.rest.pulls.merge({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr_number,
               });
-              console.log('Merged 🎉');
+              console.log('✅ Merged.');
             }

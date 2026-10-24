@@ -7,3 +7,6 @@
 - feat(action): capture PR details with optional API enrichment
 - feat(action): support target SHA overrides
 - feat(action): expose typed JSON context alongside individual outputs
+
+#!dummy/v0.1.0
+- feat(action): print a testing-only message

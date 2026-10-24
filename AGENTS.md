@@ -5,14 +5,16 @@
 - This repository is a collection of reusable GitHub actions, not one root action.
   Each public action occupies a lowercase kebab-case directory directly under the
   repository root.
-- Each action must contain `action.yml`, its own `README.md`, and `tests/run.sh`.
-  Keep implementation files, dependency manifests, lockfiles, and runtime assets
-  within that action's directory. Choose the runtime per action; do not impose a
-  repository-wide application framework or package version.
+- Each action must contain `action.yml`, its own `README.md`, `RELEASE-NOTES.md`,
+  and `tests/run.sh`. Keep implementation files, dependency manifests, lockfiles,
+  and runtime assets within that action's directory. Choose the runtime per action;
+  do not impose a repository-wide application framework or package version.
 - Keep the root README concise and focused on business value, the action catalog,
   and consumer-facing usage. Keep internal development, CI, and release procedures
   in these instructions, not the README.
 - Do not add placeholder actions or describe examples as published functionality.
+- `dummy` is an internal release-flow test action, not a public catalog entry.
+  Keep it out of the root README and do not present it as production functionality.
 
 ## Implementation and compatibility
 
@@ -35,6 +37,11 @@
   secrets; use least-privilege tokens and explicit, actionable failures.
 - Write outputs through GitHub's supported output mechanism, such as
   `$GITHUB_OUTPUT`, and preserve the documented output format.
+- Prefix human-readable workflow/script messages with ℹ️ for information, ✅ for
+  success, ⚠️ for warnings, and ❌ for errors. Keep annotation commands, required
+  check names, machine-readable outputs, and release-note content unchanged.
+  Python CLIs configure UTF-8 output, and Python workflows set
+  `PYTHONIOENCODING: "utf-8"`; decode captured log output as UTF-8 on Windows too.
 
 ## Validation
 
@@ -42,7 +49,8 @@
 - Repository tooling requires Python 3.12+. Install its dependencies from
   `.github/requirements.txt`, preferably in a virtual environment.
 - Validate repository metadata with
-  `python .github\scripts\monorepo.py validate`.
+  `python .github\scripts\monorepo.py validate`. The log lists each schema group
+  and the files being checked.
 - Test repository tooling with
   `python -m unittest discover --start-directory .github\scripts --pattern "test_*.py"`.
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
@@ -62,19 +70,48 @@
 - CI currently validates and tests all actions. Preserve this coverage for shared
   changes if introducing path-based optimization later.
 - CI first runs the local `workflow-context` action and passes its `target-sha`
-  output to downstream checkout steps.
-- CI's `ParseChangelog` job reports pending action versions and their changelogs.
-  On `release/<action>` branches, inspect only that action; other branches inspect
-  all actions. Pull requests use their target/base branch for this scope.
+  output to downstream checkout steps. Reusable CI accepts `target-sha` and
+  `target-branch`; use the explicit SHA rather than a moving branch.
+- PRs targeting `release/<action>` must originate from `<prefix>/<same-action>`,
+  using any non-empty first path component as the prefix. Reject mismatched
+  actions, unscoped sources such as `main`, and nested or malformed action suffixes.
+  Other PR targets, including promotion into `main`, are unaffected.
+  `ParseChangelog` runs `python .github\scripts\monorepo.py validate-pr-branches`
+  with `PR_HEAD_REF` and `PR_BASE_REF` before changelog validation/planning.
+  PR `edited` events rerun CI so retargeting cannot reuse the previous routing check.
+- CI's `ParseChangelog` job reports pending action releases and exports their
+  inputs as a matrix. First validate the whole changelog with
+  `python .github\scripts\monorepo.py validate-changelog`, regardless of branch
+  scope. Then, on `<prefix>/<action>` branches with any non-empty prefix, inspect
+  only that action; branches without such a prefix inspect all actions. Pull
+  requests use their target/base branch for this scope.
+- CI's `PreviewRelease` job invokes pinned `btnguyen2k/action-semrelease` in
+  read-only dry-run mode for each selected section. Capture `result`,
+  `releaseVersion`, and `releaseNotes` in each matrix job's logs and summary, not
+  shared matrix job outputs that could overwrite one another. Validate the
+  captured target SHA against the full workflow ref, including PR merge refs.
+  The release workflow calls CI with `skip-release-preview: true`, then calculates
+  only after all native validation jobs and changelog validation pass.
+- CI exposes stable matrix marker checks `ValidatePass` and `PreviewReleasePass`.
+  Both run even after dependency failures. `ValidatePass` requires the entire
+  validation matrix to succeed. `PreviewReleasePass` requires successful
+  changelog planning and successful previews, or an intentional preview skip
+  (no selected releases, explicit preview disable, or a deleted branch).
+  Failures, cancellations, and unexpected skips fail the corresponding marker.
+- Standalone push CI excludes `release/**`; the release workflow owns those
+  pushes. Ordinary branch pushes, pull requests (including those into release
+  branches), and manual CI keep their existing coverage and previews.
 - Run the same report locally with `python .github\scripts\monorepo.py changelog`;
   set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
+  This command prepares release inputs; version calculation and final release
+  notes are delegated to action-semrelease in CI, not implemented in Python.
 
 ## Commit messages
 
 - For action changes, use `type(action): <description>` for every release,
   including a brand-new action's first release. Choose the appropriate commit
   type and keep the description short, concise, and focused on the actual change.
-- The changelog section header supplies the action name and release version.
+- The changelog section header supplies the action name and optional release version.
   Do not repeat them as add-action announcements or release-version prefixes;
   use the literal scope `action`, not an action-specific scope.
 - If an action version includes multiple updates, generate a separate
@@ -83,12 +120,21 @@
 ## Releases and workflows
 
 - Stage release notes in `.semrelease/this_release` under
-  `#!<action-name>/v<version-number>` headers, allowing zero or more spaces after
-  `#!`. Blank lines and ordinary `#` comment lines do not count as changelog entries.
+  `#!<action-name>/v<version-number>` for a fixed version or `#!<action-name>` for
+  automatic versioning, allowing zero or more spaces after `#!`. Pass
+  `<action-name>/v` as `tag-prefix`, the fixed version or an empty string as
+  `version`, and the section's multiline messages as `change-log`. Do not use
+  repository-wide `#!VERSION` directives. Blank lines and ordinary `#` comment
+  lines do not count as changelog entries.
 - Changelog reporting warns and excludes malformed headers, invalid action names
-  or stable versions, unknown actions, empty sections, and multiple non-empty
-  sections for one action. A release branch with no valid matching section also
-  warns. These warnings do not fail the job; unreadable or missing files do.
+  or stable versions, unknown actions, and empty sections. An action-scoped branch
+  with no valid matching section also warns. These warnings do not fail validation.
+- Each known action may have at most one valid section header, including when its
+  body is empty. Duplicate headers fail changelog validation with the action name
+  and source line numbers, whether their versions match, differ, or are omitted.
+  Missing or unreadable changelog files also fail. An empty plan skips release
+  previews; action-semrelease failures still fail CI, and `SKIPPED` remains distinct
+  from `SUCCESS`.
 - Actions are versioned independently. Full release tags are
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable
@@ -96,21 +142,92 @@
 - Do not create unprefixed repository-wide version tags or bump unaffected
   actions. A tag selects a whole-repository snapshot but releases only the named
   action.
-- Use `.github/workflows/release.yml` from the default branch for stable releases.
-  Its version input omits the `v`. Keep release notes scoped to that action and
-  explain migrations for breaking changes. Prereleases require an explicit future
-  extension, not a workaround.
+- `.github/workflows/release.yml` publishes stable releases after a verified PR
+  merge into `release/<action>`. Branch creation/deletion, forced pushes, ordinary
+  direct pushes, and generated notes/cleanup pushes do not start release cycles.
+  Verify the merged PR's base branch and merge SHA; do not infer a merge from its
+  commit message. Notes/cleanup pushes made with `GITHUB_TOKEN` do not trigger
+  additional push workflows.
+- Trusted release verification rechecks the same source/target action pairing
+  from the merged PR's API metadata before CI and publication. A mismatch is an
+  explicit error before CI/publication, not an ignored direct push.
+- Capture context with `workflow-context`, pin the original merge SHA R, and run
+  native CI on R before calculating version/notes. Require `SUCCESS`, a bare
+  stable version matching any fixed header, nonempty generated notes, and actual
+  successful CI evidence for R. No prerelease support is implied.
+- Prepend `## v<version>` and generated notes to `<action>/RELEASE-NOTES.md`,
+  preserving the title on line 1 and all older entries. An identical existing
+  entry is a no-op; conflicting notes or duplicate version headings fail.
+  The controlled writer changes only this text file to create N. Do not rerun
+  CI or add a separate Git diff-check stage for N. Publish/tag N, not cleanup C.
+- Freeze the validated job-local `release-state.json` plan before publication.
+  Keep the version, notes, original merge SHA, current-run/attempt CI evidence,
+  commit SHAs, and content digests in that local file only; do not upload/download
+  release-state artifacts or restore plans from earlier runs. Generated commits
+  use the plan's timestamp and isolated Git indexes without staging other work.
+- After publication succeeds, remove only that action's staged section and push
+  cleanup C onto the same release branch. Preserve other sections and the committed
+  release-notes history. Push notes and cleanup with expected-head leases; stop
+  on unexpected branch movement rather than overwriting it.
+- Create the promotion PR into the default branch for **manual merge** after
+  required checks and reviews. Never request auto-merge or push directly to the
+  default branch. Only one active cycle per action is allowed until promotion is
+  merged; release branches should start their next cycle from the latest default
+  branch.
+- Promotion PRs created/updated with `GITHUB_TOKEN` start their opened/synchronize/
+  reopened CI runs in an approval-required state. A user with write access selects
+  **Approve workflows to run**, waits for CI and reviews, then merges manually.
+  Workflow approval only starts CI; it does not approve the code or merge the PR.
+- Release helpers and the context action run from the captured default-branch
+  automation checkout, not candidate code with a write token. Candidate code runs
+  only in read-only CI. The release calculator is SHA-pinned and runs in dry-run mode.
+  Keep release notes scoped to their action and explain migrations for breaking
+  changes.
 - Never publish, push tags, or create GitHub releases without an explicit user
   request. Adding or updating release automation is not permission to run it.
-- If tag pushes succeed but release creation fails, rerun the failed workflow on
-  the same commit and version. Do not move immutable version tags to recover.
+- Interrupted releases require **manual reconciliation**, not automatic resume.
+  There is no recovery dispatch, artifact checkpoint, or historical CI reuse.
+  Retry with **Re-run all jobs** only if no release writes occurred; every attempt
+  needs its own successful pinned-SHA CI. Failed-jobs-only reruns cannot borrow
+  native CI successes from an earlier attempt.
+- If notes/cleanup commits, tags, a GitHub release, or a promotion PR already
+  exist, inspect and finish the interrupted release manually. Do not recalculate
+  another version, overwrite full-version tags, or replay completed writes.
+  If creating the promotion PR manually, include
+  `<!-- action-release:<action>:<original-merge-sha> -->` in its body so the next
+  cycle can verify that the previous bookkeeping was promoted.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
   never attach GitHub releases to moving aliases or mark an action release as
   the repository-wide "latest" release.
-- Keep workflow permissions read-only by default; scope `contents: write` to the
-  publishing job. Pin external actions to full commit SHAs, with version comments.
-  Supply dispatch inputs to scripts via environment variables, not shell
-  interpolation.
+- Keep workflow permissions read-only by default. Only the trusted `Release` job
+  grants `GITHUB_TOKEN` contents/pull-request write permissions, with actions read
+  access retained for current-attempt CI verification. It supplies this token as
+  `GH_TOKEN` for notes/publishing/cleanup/promotion; context capture and candidate
+  CI stay read-only. Do not add GitHub App or personal-token dependencies. Pin
+  external actions to full commit SHAs, with version comments. Supply dispatch
+  inputs to scripts via environment variables, not shell interpolation.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
+
+### Release automation setup
+
+- Merge this automation into the default branch before creating/updating release
+  branches; privileged jobs load their helpers from that trusted checkout.
+- Use the built-in `GITHUB_TOKEN`; no App credentials or personal token are
+  required. Under **Settings > Actions > General > Workflow permissions**, enable
+  **Allow GitHub Actions to create and approve pull requests** so the workflow can
+  create promotion PRs. The workflow never approves or merges them automatically.
+- Require checks/reviews for incoming release PRs and prevent force-pushes/deletion
+  on release branches. Branch/tag rules must also permit the controlled notes/
+  cleanup pushes and tag writes: required checks on every new commit without an
+  applicable exception will block N/C, which intentionally receive no separate CI.
+  Token write permissions do not bypass protections. Keep default-branch
+  protections intact and protect immutable full-version tags while allowing
+  compatibility alias updates.
+- Keep required native CI checks/reviews on the default branch. Promotion is
+  manual; enabling repository auto-merge is not required.
+- Automatic version baselines follow action-semrelease's prefix-filtered API
+  ordering, not necessarily highest numeric SemVer. Use fixed-version headers
+  for maintenance/backport releases; the publisher still keeps aliases on the
+  highest stable numeric versions.
