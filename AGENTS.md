@@ -80,6 +80,12 @@
   captured target SHA against the full workflow ref, including PR merge refs.
   The release workflow calls CI with `skip-release-preview: true`, then calculates
   only after all native validation jobs and changelog validation pass.
+- CI exposes stable matrix marker checks `ValidatePass` and `PreviewReleasePass`.
+  Both run even after dependency failures. `ValidatePass` requires the entire
+  validation matrix to succeed. `PreviewReleasePass` requires successful
+  changelog planning and successful previews, or an intentional preview skip
+  (no selected releases, explicit preview disable, or a deleted branch).
+  Failures, cancellations, and unexpected skips fail the corresponding marker.
 - Standalone push CI excludes `release/**`; the release workflow owns those
   pushes. Ordinary branch pushes, pull requests (including those into release
   branches), and manual CI keep their existing coverage and previews.

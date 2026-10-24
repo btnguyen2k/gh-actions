@@ -126,6 +126,35 @@ jobs:
           RELEASE_NOTES: ${{ steps.semrelease.outputs.releaseNotes }}
         run: python .github/scripts/monorepo.py release-preview
 
+  PreviewReleasePass:
+    name: PreviewReleasePass
+    needs: [ParseChangelog, PreviewRelease]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful release previews or an intentional skip
+        shell: bash
+        env:
+          CHANGELOG_RESULT: ${{ needs.ParseChangelog.result }}
+          PREVIEW_RESULT: ${{ needs.PreviewRelease.result }}
+          SKIP_EXPECTED: ${{ inputs.skip-release-preview || needs.ParseChangelog.outputs.has-releases == 'false' || github.event.deleted == true }}
+        run: |
+          if [ "$CHANGELOG_RESULT" != "success" ]; then
+            echo "::error::ParseChangelog completed with result '$CHANGELOG_RESULT'; expected success."
+            exit 1
+          fi
+          if [ "$PREVIEW_RESULT" = "success" ]; then
+            echo "All release previews passed."
+            exit 0
+          fi
+          if [ "$PREVIEW_RESULT" = "skipped" ] && [ "$SKIP_EXPECTED" = "true" ]; then
+            echo "Release preview was intentionally skipped."
+            exit 0
+          fi
+          echo "::error::PreviewRelease completed with result '$PREVIEW_RESULT'; expected success or an intentional skip."
+          exit 1
+
   Validate:
     name: Validate and test (${{ matrix.os }})
     needs: CaptureContext
@@ -163,3 +192,21 @@ jobs:
         run: python .github/scripts/monorepo.py test
       - name: Check tracked generated files
         run: git diff --exit-code HEAD --
+
+  ValidatePass:
+    name: ValidatePass
+    needs: Validate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful validation
+        shell: bash
+        env:
+          JOB_RESULT: ${{ needs.Validate.result }}
+        run: |
+          if [ "$JOB_RESULT" != "success" ]; then
+            echo "::error::Validate completed with result '$JOB_RESULT'; expected success."
+            exit 1
+          fi
+          echo "All validation jobs passed."

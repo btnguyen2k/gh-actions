@@ -854,6 +854,97 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.preview)
 
 
+class CIMarkerWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        from ruamel.yaml import YAML
+
+        workflow = YAML(typ="safe").load(
+            (monorepo.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        self.jobs = workflow["jobs"]
+        self.bash = "bash"
+        if sys.platform == "win32":
+            native = Path(monorepo.capture(
+                monorepo.ROOT, "git", "var", "GIT_SHELL_PATH",
+            )).with_name("bash.exe")
+            self.assertTrue(native.is_absolute() and native.is_file())
+            self.bash = str(native)
+
+    def run_marker(self, name, environment):
+        return subprocess.run(
+            [
+                self.bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
+                self.jobs[name]["steps"][0]["run"],
+            ],
+            cwd=monorepo.ROOT, env={**os.environ, **environment},
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+
+    def test_marker_jobs_have_stable_names_and_run_after_failed_dependencies(self):
+        for name, needs in (
+            ("ValidatePass", "Validate"),
+            ("PreviewReleasePass", ["ParseChangelog", "PreviewRelease"]),
+        ):
+            with self.subTest(name=name):
+                marker = self.jobs[name]
+                self.assertEqual(marker["name"], name)
+                self.assertEqual(marker["needs"], needs)
+                self.assertEqual(marker["if"], "${{ always() }}")
+                self.assertEqual(marker["runs-on"], "ubuntu-latest")
+                self.assertEqual(marker["timeout-minutes"], 5)
+                self.assertNotIn("strategy", marker)
+                self.assertNotIn("continue-on-error", marker)
+                self.assertEqual(len(marker["steps"]), 1)
+                self.assertEqual(marker["steps"][0]["shell"], "bash")
+                self.assertNotIn("continue-on-error", marker["steps"][0])
+
+    def test_marker_inputs_distinguish_intentional_skips_from_upstream_errors(self):
+        self.assertEqual(self.jobs["ValidatePass"]["steps"][0]["env"], {
+            "JOB_RESULT": "${{ needs.Validate.result }}",
+        })
+        self.assertEqual(self.jobs["PreviewReleasePass"]["steps"][0]["env"], {
+            "CHANGELOG_RESULT": "${{ needs.ParseChangelog.result }}",
+            "PREVIEW_RESULT": "${{ needs.PreviewRelease.result }}",
+            "SKIP_EXPECTED": (
+                "${{ inputs.skip-release-preview "
+                "|| needs.ParseChangelog.outputs.has-releases == 'false' "
+                "|| github.event.deleted == true }}"
+            ),
+        })
+
+    def test_validation_marker_requires_success(self):
+        for status in ("success", "failure", "cancelled", "skipped", ""):
+            with self.subTest(status=status):
+                result = self.run_marker("ValidatePass", {"JOB_RESULT": status})
+                self.assertEqual(
+                    result.returncode == 0, status == "success", result.stdout + result.stderr,
+                )
+                if status != "success":
+                    self.assertIn("::error::Validate", result.stdout)
+
+    def test_preview_marker_requires_successful_planning_and_success_or_intentional_skip(self):
+        statuses = ("success", "failure", "cancelled", "skipped", "")
+        for changelog in statuses:
+            for preview in statuses:
+                for skip in ("true", "false"):
+                    with self.subTest(changelog=changelog, preview=preview, skip=skip):
+                        result = self.run_marker("PreviewReleasePass", {
+                            "CHANGELOG_RESULT": changelog,
+                            "PREVIEW_RESULT": preview,
+                            "SKIP_EXPECTED": skip,
+                        })
+                        expected = changelog == "success" and (
+                            preview == "success" or preview == "skipped" and skip == "true"
+                        )
+                        self.assertEqual(
+                            result.returncode == 0, expected, result.stdout + result.stderr,
+                        )
+                        if not expected:
+                            self.assertIn("::error::", result.stdout)
+                        elif preview == "skipped":
+                            self.assertIn("intentionally skipped", result.stdout)
+
+
 class ReleaseCommandTests(RepositoryTestCase):
     def setUp(self):
         super().setUp()
