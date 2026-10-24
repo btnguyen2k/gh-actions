@@ -386,7 +386,6 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
     emit(
         eligible=True, action=action, branch=cycle.branch, merge_sha=cycle.merge_sha,
         source_run_id=cycle.source_run_id, source_pr=cycle.source_pr,
-        trusted_sha=git(root, "rev-parse", "HEAD"),
     )
 
 

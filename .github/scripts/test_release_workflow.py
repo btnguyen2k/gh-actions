@@ -298,7 +298,7 @@ class CalculationTests(ReleaseFixture):
             self.calculate()
         self.assertEqual(release.load(self.path, self.cycle), plan)
 
-    def test_inputs_fetch_merge_into_a_separate_trusted_checkout(self):
+    def test_inputs_use_release_commit_without_advancing_default_branch(self):
         candidate = release.commit_file(
             self.root, self.merge, "dummy/main.sh", b"echo candidate\n",
             "2026-01-01T00:00:00+00:00", "Candidate merge\n",
@@ -306,18 +306,16 @@ class CalculationTests(ReleaseFixture):
         release.push_branch(self.root, self.cycle.branch, self.merge, candidate)
         self.client.runs[17]["head_sha"] = candidate
         self.client.source_pr["merge_commit_sha"] = candidate
-        fresh = self.parent / "trusted checkout"
+        fresh = self.parent / "release checkout"
         release.git(
             self.parent, "clone", "--quiet", "--no-local", "--single-branch",
-            "--branch", "main", "--depth", "1", str(self.remote), str(fresh),
+            "--branch", self.cycle.branch, "--depth", "1", str(self.remote), str(fresh),
         )
-        with self.assertRaises(subprocess.CalledProcessError):
-            release.git(fresh, "cat-file", "-e", f"{candidate}^{{commit}}")
         with patch.dict(os.environ, {"MERGE_SHA": candidate}), patch("release_workflow.emit") as emit:
             release.inputs(fresh, self.client, self.path)
         self.assertEqual(emit.call_args.kwargs["tag_prefix"], "dummy/v")
-        self.assertEqual(release.git(fresh, "rev-parse", "HEAD"), self.merge)
-        self.assertEqual(release.git(fresh, "rev-parse", f"{candidate}^{{commit}}"), candidate)
+        self.assertEqual(release.git(fresh, "rev-parse", "HEAD"), candidate)
+        self.assertEqual(release.remote_head(fresh, "main"), self.merge)
 
     def test_existing_release_is_rejected_before_notes_are_pushed(self):
         self.client.releases["dummy/v0.1.0"] = {
@@ -354,9 +352,8 @@ class ContextTests(ReleaseFixture):
         self.assertTrue(values["eligible"])
         self.assertEqual(values["merge_sha"], self.merge)
         self.assertEqual(values["source_pr"], 7)
-        self.assertEqual(values["trusted_sha"], self.merge)
         self.assertEqual(set(values), {
-            "eligible", "action", "branch", "merge_sha", "source_run_id", "source_pr", "trusted_sha",
+            "eligible", "action", "branch", "merge_sha", "source_run_id", "source_pr",
         })
 
     def test_merged_pr_routing_errors_fail_before_ci_or_publication(self):
@@ -762,6 +759,24 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("skipped", self.jobs["Release"]["if"])
         self.assertEqual(ci["if"], "${{ needs.CaptureContext.outputs.eligible == 'true' }}")
 
+    def test_release_checkouts_use_incoming_code_not_the_default_branch(self):
+        for job, reference in (
+            ("CaptureContext", "${{ github.sha }}"),
+            ("Release", "${{ needs.CaptureContext.outputs.merge-sha }}"),
+        ):
+            with self.subTest(job=job):
+                checkout = self.jobs[job]["steps"][0]
+                self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+                self.assertEqual(checkout["with"]["ref"], reference)
+                self.assertEqual(checkout["with"]["fetch-depth"], 0)
+                self.assertFalse(checkout["with"]["persist-credentials"])
+        self.assertEqual(
+            self.jobs["CaptureContext"]["outputs"]["merge-sha"],
+            "${{ steps.gate.outputs.merge-sha }}",
+        )
+        self.assertNotIn("trusted-sha", self.jobs["CaptureContext"]["outputs"])
+        self.assertNotIn("outputs.trusted-sha", self.workflow_text)
+
     def test_reusable_ci_exposes_actual_target_and_preserves_normal_previews(self):
         call = self.ci["on"]["workflow_call"]
         self.assertFalse(call["inputs"]["skip-release-preview"]["default"])
@@ -804,7 +819,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("if", self.named["Prepare the notes-only and cleanup commits"])
         self.assertFalse(any(step.get("continue-on-error") for step in self.steps))
 
-    def test_only_trusted_release_job_can_write_with_github_token(self):
+    def test_only_release_job_can_write_with_github_token(self):
         self.assertEqual(self.workflow["permissions"], {
             "contents": "read", "actions": "read", "pull-requests": "read",
         })
@@ -815,9 +830,6 @@ class ReleaseWorkflowTests(unittest.TestCase):
         })
         token = self.jobs["Release"]["env"]["GH_TOKEN"]
         self.assertEqual(token, "${{ github.token }}")
-        checkout = self.named["Checkout trusted automation"]
-        self.assertEqual(checkout["with"]["ref"], "${{ needs.CaptureContext.outputs.trusted-sha }}")
-        self.assertFalse(checkout["with"]["persist-credentials"])
         for name in (
             "Commit the release-notes update", "Publish immutable release and compatibility aliases",
             "Clean only the published changelog section", "Create the promotion PR for manual merge",
