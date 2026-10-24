@@ -146,9 +146,10 @@
   merge into `release/<action>`. Branch creation/deletion, forced pushes, ordinary
   direct pushes, and generated notes/cleanup pushes do not start release cycles.
   Verify the merged PR's base branch and merge SHA; do not infer a merge from its
-  commit message.
+  commit message. Notes/cleanup pushes made with `GITHUB_TOKEN` do not trigger
+  additional push workflows.
 - Trusted release verification rechecks the same source/target action pairing
-  from the merged PR's API metadata for new cycles and recovery. A mismatch is an
+  from the merged PR's API metadata before CI and publication. A mismatch is an
   explicit error before CI/publication, not an ignored direct push.
 - Capture context with `workflow-context`, pin the original merge SHA R, and run
   native CI on R before calculating version/notes. Require `SUCCESS`, a bare
@@ -159,44 +160,53 @@
   entry is a no-op; conflicting notes or duplicate version headings fail.
   The controlled writer changes only this text file to create N. Do not rerun
   CI or add a separate Git diff-check stage for N. Publish/tag N, not cleanup C.
-- Freeze the validated plan before publication. Immutable calculation,
-  preparation, and frozen-plan artifacts are named
-  `release-state-<action>-<merge-sha>-<attempt>-<stage>`. Verify their digest,
-  workflow/ref provenance, original PR merge, and CI evidence before recovery.
-  Never recalculate a recorded automatic version or substitute the dispatch SHA
-  or current branch head. Generated commits use recorded timestamps and isolated
-  Git indexes so retries reconstruct the same N and C without staging other work.
+- Freeze the validated job-local `release-state.json` plan before publication.
+  Keep the version, notes, original merge SHA, current-run/attempt CI evidence,
+  commit SHAs, and content digests in that local file only; do not upload/download
+  release-state artifacts or restore plans from earlier runs. Generated commits
+  use the plan's timestamp and isolated Git indexes without staging other work.
 - After publication succeeds, remove only that action's staged section and push
   cleanup C onto the same release branch. Preserve other sections and the committed
   release-notes history. Push notes and cleanup with expected-head leases; stop
   on unexpected branch movement rather than overwriting it.
-- Create/reuse the promotion PR into the default branch for **manual merge** after
+- Create the promotion PR into the default branch for **manual merge** after
   required checks and reviews. Never request auto-merge or push directly to the
   default branch. Only one active cycle per action is allowed until promotion is
   merged; release branches should start their next cycle from the latest default
   branch.
+- Promotion PRs created/updated with `GITHUB_TOKEN` start their opened/synchronize/
+  reopened CI runs in an approval-required state. A user with write access selects
+  **Approve workflows to run**, waits for CI and reviews, then merges manually.
+  Workflow approval only starts CI; it does not approve the code or merge the PR.
 - Release helpers and the context action run from the captured default-branch
   automation checkout, not candidate code with a write token. Candidate code runs
-  only in read-only CI. The release calculator is SHA-pinned and read-only.
+  only in read-only CI. The release calculator is SHA-pinned and runs in dry-run mode.
   Keep release notes scoped to their action and explain migrations for breaking
   changes.
 - Never publish, push tags, or create GitHub releases without an explicit user
   request. Adding or updating release automation is not permission to run it.
-- If a release is interrupted, rerun its failed jobs. Alternatively, dispatch
-  `release.yml` from the default branch with `action` and `run-id` identifying the
-  original push run, or a recovery run with saved state. There are no manual
-  version/notes overrides. Resume matching tags/releases, notes commits, cleanup,
-  and promotion rather than duplicating them. Missing/expired state or conflicting
-  external state requires manual reconciliation, never a guessed new version.
+- Interrupted releases require **manual reconciliation**, not automatic resume.
+  There is no recovery dispatch, artifact checkpoint, or historical CI reuse.
+  Retry with **Re-run all jobs** only if no release writes occurred; every attempt
+  needs its own successful pinned-SHA CI. Failed-jobs-only reruns cannot borrow
+  native CI successes from an earlier attempt.
+- If notes/cleanup commits, tags, a GitHub release, or a promotion PR already
+  exist, inspect and finish the interrupted release manually. Do not recalculate
+  another version, overwrite full-version tags, or replay completed writes.
+  If creating the promotion PR manually, include
+  `<!-- action-release:<action>:<original-merge-sha> -->` in its body so the next
+  cycle can verify that the previous bookkeeping was promoted.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
   never attach GitHub releases to moving aliases or mark an action release as
   the repository-wide "latest" release.
-- Keep workflow permissions read-only by default. The release workflow's
-  `GITHUB_TOKEN` has contents, actions, and pull-request read permissions; supply
-  the repository-scoped App token only to notes/publishing/cleanup/promotion
-  steps. Pin external actions to full commit SHAs, with version comments. Supply
-  dispatch inputs to scripts via environment variables, not shell interpolation.
+- Keep workflow permissions read-only by default. Only the trusted `Release` job
+  grants `GITHUB_TOKEN` contents/pull-request write permissions, with actions read
+  access retained for current-attempt CI verification. It supplies this token as
+  `GH_TOKEN` for notes/publishing/cleanup/promotion; context capture and candidate
+  CI stay read-only. Do not add GitHub App or personal-token dependencies. Pin
+  external actions to full commit SHAs, with version comments. Supply dispatch
+  inputs to scripts via environment variables, not shell interpolation.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 
@@ -204,20 +214,19 @@
 
 - Merge this automation into the default branch before creating/updating release
   branches; privileged jobs load their helpers from that trusted checkout.
-- Install a GitHub App on this repository with Contents: read/write and Pull
-  requests: read/write. Set repository variable `RELEASE_APP_CLIENT_ID` and secret
-  `RELEASE_APP_PRIVATE_KEY`. The workflow mints a short-lived token restricted to
-  this repository and these permissions; do not fall back to a personal token or
-  `GITHUB_TOKEN` for generated promotion PRs.
-- Require reviewed PRs and prevent force-pushes/deletion on release branches.
-  Allow the App to bypass release-branch PR/check requirements only for its
-  controlled notes/cleanup writes. Do not give it a bypass of default-branch
-  protections. Protect immutable full-version tags while allowing compatibility
-  alias updates.
+- Use the built-in `GITHUB_TOKEN`; no App credentials or personal token are
+  required. Under **Settings > Actions > General > Workflow permissions**, enable
+  **Allow GitHub Actions to create and approve pull requests** so the workflow can
+  create promotion PRs. The workflow never approves or merges them automatically.
+- Require checks/reviews for incoming release PRs and prevent force-pushes/deletion
+  on release branches. Branch/tag rules must also permit the controlled notes/
+  cleanup pushes and tag writes: required checks on every new commit without an
+  applicable exception will block N/C, which intentionally receive no separate CI.
+  Token write permissions do not bypass protections. Keep default-branch
+  protections intact and protect immutable full-version tags while allowing
+  compatibility alias updates.
 - Keep required native CI checks/reviews on the default branch. Promotion is
   manual; enabling repository auto-merge is not required.
-- Keep release-state artifacts for the full release/recovery cycle using the
-  repository's artifact-retention settings. Do not delete them mid-cycle.
 - Automatic version baselines follow action-semrelease's prefix-filtered API
   ordering, not necessarily highest numeric SemVer. Use fixed-version headers
   for maintenance/backport releases; the publisher still keeps aliases on the

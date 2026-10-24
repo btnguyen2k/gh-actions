@@ -1,12 +1,10 @@
 import argparse
 import hashlib
-import io
 import json
 import os
 import re
 import subprocess
 import tempfile
-import zipfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +16,6 @@ import monorepo
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 WORKFLOW = ".github/workflows/release.yml"
-STAGES = {"calculated": 1, "prepared": 2, "frozen": 3}
-ARTIFACT = re.compile(
-    r"release-state-([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9a-f]{40})-"
-    r"([1-9][0-9]*)-(restored|calculated|prepared|frozen)"
-)
 CI_JOBS = (
     "Parse release changelog",
     "Validate and test (ubuntu-latest)",
@@ -134,7 +127,7 @@ class Plan:
         ):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"Invalid release plan field: {name}.")
-        if self.stage not in STAGES:
+        if self.stage not in ("calculated", "prepared", "frozen"):
             raise ValueError("Invalid release plan stage.")
         monorepo.parse_version(self.version)
         if self.requested_version:
@@ -152,6 +145,8 @@ class Plan:
         for value in (self.ci_run_id, self.ci_run_attempt):
             if type(value) is not int or value < 1:
                 raise ValueError("Invalid CI evidence.")
+        if self.ci_run_id != self.cycle.source_run_id:
+            raise ValueError("CI must belong to this release workflow run.")
         if self.ci_target_sha != self.cycle.merge_sha:
             raise ValueError("CI did not select the pinned release merge SHA.")
         if self.stage != "calculated":
@@ -172,12 +167,6 @@ class Plan:
             raise ValueError("Malformed release plan.") from error
         plan.validate()
         return plan
-
-    @property
-    def core(self):
-        return replace(
-            self, stage="calculated", release_sha="", history_digest="", cleanup_sha="",
-        )
 
     @property
     def tag(self) -> str:
@@ -254,37 +243,6 @@ class GitHub:
             )
         return self.runs[run_id]
 
-    def download(self, artifact) -> Plan:
-        content = run(
-            self.root, "gh", "api", "--hostname", self.host,
-            f"repos/{self.repository}/actions/artifacts/{artifact['id']}/zip",
-        )
-        if artifact.get("digest") != f"sha256:{digest(content)}":
-            raise ValueError("Release artifact digest is missing or does not match.")
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            entries = archive.infolist()
-            if (
-                len(entries) != 1 or entries[0].filename != "release-state.json"
-                or entries[0].is_dir() or entries[0].file_size > 1024 * 1024
-            ):
-                raise ValueError("A release artifact must contain only release-state.json.")
-            return Plan.decode(archive.read(entries[0]))
-
-
-def trusted_run(run_data, repository: str, default_branch: str) -> bool:
-    if (
-        run_data["repository"]["full_name"] != repository
-        or run_data["path"].split("@")[0] != WORKFLOW
-    ):
-        return False
-    if not isinstance(run_data["head_branch"], str):
-        return False
-    return (
-        run_data["event"] == "push" and run_data["head_branch"].startswith("release/")
-        or run_data["event"] == "workflow_dispatch"
-        and run_data["head_branch"] == default_branch
-    )
-
 
 def matching_merge(pr, cycle: Cycle) -> bool:
     return (
@@ -295,9 +253,12 @@ def matching_merge(pr, cycle: Cycle) -> bool:
 
 
 def verify_source(client: GitHub, cycle: Cycle) -> None:
+    if cycle.source_run_id != positive_integer(os.environ["GITHUB_RUN_ID"]):
+        raise ValueError("Release must use the current workflow run; reconcile interrupted releases manually.")
     source = client.workflow_run(cycle.source_run_id)
     if (
-        not trusted_run(source, cycle.repository, cycle.default_branch)
+        source["repository"]["full_name"] != cycle.repository
+        or source["path"].split("@")[0] != WORKFLOW
         or source["event"] != "push" or source["head_sha"] != cycle.merge_sha
         or source["head_branch"] != cycle.branch
     ):
@@ -308,37 +269,31 @@ def verify_source(client: GitHub, cycle: Cycle) -> None:
     monorepo.validate_release_pr_branches(pr["head"]["ref"], pr["base"]["ref"])
 
 
-def ci_evidence(client: GitHub, run_id: int, attempt: int):
+def verify_ci(client: GitHub, plan: Plan) -> None:
+    verify_source(client, plan.cycle)
+    if (
+        plan.ci_run_id != plan.cycle.source_run_id
+        or plan.ci_run_attempt != positive_integer(os.environ["GITHUB_RUN_ATTEMPT"])
+    ):
+        raise ValueError("CI evidence must identify the current release run and attempt.")
     jobs = client.pages(
-        f"repos/{client.repository}/actions/runs/{run_id}/jobs?filter=all", "jobs",
+        f"repos/{client.repository}/actions/runs/{plan.ci_run_id}"
+        f"/attempts/{plan.ci_run_attempt}/jobs", "jobs",
     )
-    selected = []
     for name in CI_JOBS:
         matches = [
             job for job in jobs
-            if (job["name"] == name or job["name"].endswith(f" / {name}"))
-            and job["run_attempt"] <= attempt and job["status"] == "completed"
+            if job["name"] == name or job["name"].endswith(f" / {name}")
         ]
-        if not matches:
-            return None
-        latest = max(matches, key=lambda job: (job["run_attempt"], job["id"]))
-        if latest["conclusion"] != "success":
-            return None
-        selected.append(latest)
-    return max(job["run_attempt"] for job in selected)
-
-
-def verify_ci(client: GitHub, plan: Plan) -> None:
-    proof_run = client.workflow_run(plan.ci_run_id)
-    if not trusted_run(proof_run, plan.cycle.repository, plan.cycle.default_branch):
-        raise ValueError("CI evidence came from an untrusted workflow or ref.")
-    if proof_run["event"] == "push" and (
-        proof_run["head_sha"] != plan.cycle.merge_sha
-        or proof_run["head_branch"] != plan.cycle.branch
-    ):
-        raise ValueError("CI evidence belongs to a different release merge.")
-    if ci_evidence(client, plan.ci_run_id, plan.ci_run_attempt) is None:
-        raise ValueError("Pinned-SHA CI evidence is missing or not successful.")
+        if not matches or any(
+            job["run_attempt"] != plan.ci_run_attempt
+            or job["status"] != "completed" or job["conclusion"] != "success"
+            for job in matches
+        ):
+            raise ValueError(
+                "Current-attempt pinned-SHA CI evidence is missing or not successful. "
+                "Rerun all jobs only if no release writes occurred; otherwise reconcile manually."
+            )
 
 
 def promotions(client: GitHub, action: str, default_branch: str):
@@ -349,153 +304,60 @@ def promotions(client: GitHub, action: str, default_branch: str):
     return client.pages(f"repos/{client.repository}/pulls?{query}")
 
 
-def checkpoints(client: GitHub, action: str, default_branch: str, ignored_shas=()):
-    records = []
-    expired = set()
-    for artifact in client.pages(f"repos/{client.repository}/actions/artifacts", "artifacts"):
-        match = ARTIFACT.fullmatch(artifact["name"])
-        if not match or match[1] != action or match[2] in ignored_shas:
-            continue
-        origin = client.workflow_run(artifact["workflow_run"]["id"])
-        if not trusted_run(origin, client.repository, default_branch):
-            continue
-        if origin["event"] == "push" and (
-            origin["head_branch"] != f"release/{action}" or origin["head_sha"] != match[2]
-        ):
-            continue
-        if artifact["expired"]:
-            expired.add(match[2])
-            continue
-        plan = client.download(artifact)
-        if (
-            plan.cycle.repository != client.repository or plan.cycle.action != action
-            or plan.cycle.merge_sha != match[2] or plan.cycle.default_branch != default_branch
-            or match[4] != "restored" and plan.stage != match[4]
-        ):
-            raise ValueError("Release artifact name, stage, and cycle do not agree.")
-        records.append((plan, artifact["id"], origin["id"]))
-    return records, expired
-
-
-def select_checkpoint(records, cycle: Cycle):
-    matches = [record for record in records if record[0].cycle == cycle]
-    if not matches:
-        return None
-    core = matches[0][0].core
-    if any(record[0].core != core for record in matches):
-        raise ValueError("Conflicting calculations exist for this release cycle.")
-    prepared = [record[0] for record in matches if record[0].stage != "calculated"]
-    if prepared and any(
-        (plan.release_sha, plan.history_digest, plan.cleanup_sha)
-        != (prepared[0].release_sha, prepared[0].history_digest, prepared[0].cleanup_sha)
-        for plan in prepared
-    ):
-        raise ValueError("Conflicting prepared commits exist for this release cycle.")
-    return max(matches, key=lambda record: (STAGES[record[0].stage], record[1]))
-
-
-def had_checkpoint(client: GitHub, run_id: int) -> bool:
-    jobs = client.pages(
-        f"repos/{client.repository}/actions/runs/{run_id}/jobs?filter=all", "jobs",
-    )
-    return any(
-        step["conclusion"] == "success"
-        and step["name"] in {
-            "Save restored release plan", "Save calculated release plan",
-            "Save prepared release plan", "Freeze release plan",
-        }
-        for job in jobs for step in job.get("steps", [])
-    )
-
-
-def started_ci(client: GitHub, run_id: int) -> bool:
-    jobs = client.pages(
-        f"repos/{client.repository}/actions/runs/{run_id}/jobs?filter=all", "jobs",
-    )
-    names = (*CI_JOBS, "Capture workflow context")
-    return any(
-        job["conclusion"] != "skipped"
-        and any(job["name"].endswith(f" / {name}") for name in names)
-        for job in jobs
-    )
-
-
 def fetch(root: Path, commit: str) -> None:
     if not SHA.fullmatch(commit):
         raise ValueError("Expected an immutable commit SHA.")
     git(root, "fetch", "--quiet", "--no-tags", "origin", commit)
 
 
+def require_unstarted(root: Path, cycle: Cycle) -> None:
+    if remote_head(root, cycle.branch) != cycle.merge_sha:
+        raise ValueError("Release branch already changed; reconcile the interrupted release manually.")
+    tags = git(root, "ls-remote", "--tags", "origin", f"refs/tags/{cycle.action}/v*")
+    objects = dict(line.split()[::-1] for line in tags.splitlines())
+    prefix = f"refs/tags/{cycle.action}/v"
+    if any(
+        monorepo.VERSION.fullmatch(name[len(prefix):])
+        and objects.get(name + "^{}", target) == cycle.merge_sha
+        for name, target in objects.items() if name.startswith(prefix)
+    ):
+        raise ValueError("This merge already has a release tag; reconcile it manually.")
+
+
 def context(root: Path, client: GitHub, _path: Path) -> None:
     default = os.environ["DEFAULT_BRANCH"]
     current_run = positive_integer(os.environ["GITHUB_RUN_ID"])
     event = os.environ["GITHUB_EVENT_NAME"]
-    if event == "push":
-        payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
-        branch = os.environ["CAPTURED_BRANCH"]
-        if any(payload.get(name) is True for name in ("created", "deleted", "forced")):
-            print("ℹ️ Not a release cycle: branch creation, deletion, or forced push.")
-            emit(eligible=False)
-            return
-        action = branch.removeprefix("release/")
-        if branch != f"release/{action}" or not monorepo.ACTION_NAME.fullmatch(action):
-            print("ℹ️ Not a release cycle: expected release/<action>.")
-            emit(eligible=False)
-            return
-        merge_sha = os.environ["CAPTURED_SHA"]
-        if not SHA.fullmatch(merge_sha):
-            raise ValueError("Context capture did not return an immutable merge SHA.")
-        candidates = client.pages(
-            f"repos/{client.repository}/commits/{merge_sha}/pulls",
-        )
-        matching = [
-            pr for pr in candidates
-            if matching_merge(pr, Cycle(client.repository, action, branch, merge_sha, current_run, 1, default))
-        ]
-        if not matching:
-            print("ℹ️ Not a release cycle: this push is not a verified PR merge.")
-            emit(eligible=False)
-            return
-        if len(matching) != 1:
-            raise ValueError("More than one merged PR matches this release push.")
-        cycle = Cycle(
-            client.repository, action, branch, merge_sha, current_run,
-            matching[0]["number"], default,
-        )
-        recovery_run = current_run
-    elif event == "workflow_dispatch":
-        if os.environ["GITHUB_REF"] != f"refs/heads/{default}":
-            raise ValueError("Manual recovery must run from the default branch.")
-        action = os.environ["RECOVERY_ACTION"]
-        monorepo.validate_name(action)
-        recovery_run = positive_integer(os.environ["RECOVERY_RUN_ID"])
-        original = client.workflow_run(recovery_run)
-        if not trusted_run(original, client.repository, default):
-            raise ValueError("Recovery requires a trusted Release workflow run.")
-        records, _ = checkpoints(client, action, default)
-        if original["event"] == "push":
-            merge_sha = original["head_sha"]
-            branch = f"release/{action}"
-            if original["head_branch"] != branch:
-                raise ValueError("Recovery action does not match the source release branch.")
-            candidates = client.pages(f"repos/{client.repository}/commits/{merge_sha}/pulls")
-            matching = [
-                pr for pr in candidates
-                if matching_merge(pr, Cycle(client.repository, action, branch, merge_sha, recovery_run, 1, default))
-            ]
-            if len(matching) != 1:
-                raise ValueError("Recovery cannot verify the original merged PR.")
-            cycle = Cycle(
-                client.repository, action, branch, merge_sha, recovery_run,
-                matching[0]["number"], default,
-            )
-        else:
-            origins = {record[0].cycle for record in records if record[2] == recovery_run}
-            if len(origins) != 1:
-                raise ValueError("No unambiguous recovery checkpoint; use the original push run ID.")
-            cycle = origins.pop()
-    else:
-        raise ValueError("Only release-branch pushes and explicit recovery are supported.")
+    if event != "push":
+        raise ValueError("Only release-branch pushes are supported; reconcile interrupted releases manually.")
+    payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
+    branch = os.environ["CAPTURED_BRANCH"]
+    if any(payload.get(name) is True for name in ("created", "deleted", "forced")):
+        print("ℹ️ Not a release cycle: branch creation, deletion, or forced push.")
+        emit(eligible=False)
+        return
+    action = branch.removeprefix("release/")
+    if branch != f"release/{action}" or not monorepo.ACTION_NAME.fullmatch(action):
+        print("ℹ️ Not a release cycle: expected release/<action>.")
+        emit(eligible=False)
+        return
+    merge_sha = os.environ["CAPTURED_SHA"]
+    if not SHA.fullmatch(merge_sha):
+        raise ValueError("Context capture did not return an immutable merge SHA.")
+    candidates = client.pages(f"repos/{client.repository}/commits/{merge_sha}/pulls")
+    matching = [
+        pr for pr in candidates
+        if matching_merge(pr, Cycle(client.repository, action, branch, merge_sha, current_run, 1, default))
+    ]
+    if not matching:
+        print("ℹ️ Not a release cycle: this push is not a verified PR merge.")
+        emit(eligible=False)
+        return
+    if len(matching) != 1:
+        raise ValueError("More than one merged PR matches this release push.")
+    cycle = Cycle(
+        client.repository, action, branch, merge_sha, current_run, matching[0]["number"], default,
+    )
     cycle.validate()
     verify_source(client, cycle)
     prs = promotions(client, action, default)
@@ -505,37 +367,14 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
             rf"<!-- action-release:{re.escape(action)}:([0-9a-f]{{40}}) -->", pr["body"] or "",
         )] if match
     }
-    if any(pr["state"] == "open" and cycle.marker not in (pr["body"] or "") for pr in prs):
+    if any(pr["state"] == "open" for pr in prs):
         raise ValueError("The previous promotion PR must merge before another release cycle.")
-    records, expired = checkpoints(client, action, default, completed - {cycle.merge_sha})
-    if any(record[0].cycle.merge_sha != cycle.merge_sha for record in records):
-        raise ValueError("Another unpromoted release cycle has saved state; recover it first.")
-    if expired - completed - {cycle.merge_sha}:
-        raise ValueError("An earlier cycle has expired state and needs manual reconciliation.")
-    selected = select_checkpoint(records, cycle)
-    if selected:
-        verify_ci(client, selected[0])
-    elif cycle.merge_sha in expired or had_checkpoint(client, recovery_run):
-        raise ValueError("Release state expired or was deleted; reconcile it instead of recalculating.")
-    elif event == "workflow_dispatch" and not started_ci(client, cycle.source_run_id):
-        raise ValueError("The source run never started pinned CI; rerun the original push workflow.")
-    head = remote_head(root, cycle.branch)
-    if selected is None:
-        if head != cycle.merge_sha:
-            raise ValueError("Release branch moved and no matching recovery state is available.")
-        tags = git(root, "ls-remote", "--tags", "origin", f"refs/tags/{action}/v*")
-        objects = dict(line.split()[::-1] for line in tags.splitlines())
-        prefix = f"refs/tags/{action}/v"
-        if any(
-            monorepo.VERSION.fullmatch(name[len(prefix):])
-            and objects.get(name + "^{}", target) == cycle.merge_sha
-            for name, target in objects.items() if name.startswith(prefix)
-        ):
-            raise ValueError("This merge already has a release tag but its saved plan is unavailable.")
-    fetch(root, head)
+    if cycle.merge_sha in completed:
+        raise ValueError("This release cycle was already promoted; reconcile it manually.")
+    require_unstarted(root, cycle)
     fetch(root, cycle.merge_sha)
     messages = git(
-        root, "log", "--format=%B%x00", head, "--",
+        root, "log", "--format=%B%x00", cycle.merge_sha, "--",
         f"{cycle.action}/RELEASE-NOTES.md", ".semrelease/this_release",
     )
     for previous in re.findall(
@@ -544,34 +383,11 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
     ):
         if previous != cycle.merge_sha and previous not in completed:
             raise ValueError("An earlier notes preparation has not been promoted to main.")
-    ci_run = selected[0].ci_run_id if selected else cycle.source_run_id
-    ci_attempt = (
-        selected[0].ci_run_attempt if selected
-        else ci_evidence(
-            client, ci_run, client.workflow_run(ci_run)["run_attempt"],
-        )
-    )
     emit(
         eligible=True, action=action, branch=cycle.branch, merge_sha=cycle.merge_sha,
         source_run_id=cycle.source_run_id, source_pr=cycle.source_pr,
-        trusted_sha=git(root, "rev-parse", "HEAD"), run_ci=ci_attempt is None,
-        ci_run_id=ci_run if ci_attempt is not None else "",
-        ci_run_attempt=ci_attempt or "", ci_target_sha=cycle.merge_sha if ci_attempt else "",
+        trusted_sha=git(root, "rev-parse", "HEAD"),
     )
-
-
-def restore(root: Path, client: GitHub, path: Path) -> None:
-    cycle = Cycle.environment()
-    verify_source(client, cycle)
-    records, expired = checkpoints(client, cycle.action, cycle.default_branch)
-    selected = select_checkpoint(records, cycle)
-    if selected:
-        verify_ci(client, selected[0])
-        save(path, selected[0])
-    elif cycle.merge_sha in expired or had_checkpoint(client, cycle.source_run_id):
-        raise ValueError("Saved state is unavailable; do not guess a new release version.")
-    emit(state_present=selected is not None)
-    fetch(root, cycle.merge_sha)
 
 
 def source_section(root: Path, cycle: Cycle):
@@ -611,19 +427,19 @@ def check_source(root: Path, plan: Plan) -> bytes:
     return cleaned
 
 
-def inputs(root: Path, _client: GitHub, path: Path) -> None:
+def inputs(root: Path, client: GitHub, path: Path) -> None:
     cycle = Cycle.environment()
+    if path.exists():
+        raise ValueError("A job-local release plan already exists; reconcile it manually.")
+    verify_source(client, cycle)
+    require_unstarted(root, cycle)
+    fetch(root, cycle.merge_sha)
     section, _, _, _ = source_section(root, cycle)
-    existing = load(path, cycle) if path.is_file() else None
-    if existing:
-        check_source(root, existing)
-    else:
-        # action-semrelease still reads legacy directives when version is empty.
-        staging = root / ".semrelease" / "this_release"
-        staging.parent.mkdir(parents=True, exist_ok=True)
-        staging.write_text(section.notes + "\n", encoding="utf-8", newline="\n")
+    # action-semrelease still reads legacy directives when version is empty.
+    staging = root / ".semrelease" / "this_release"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.write_text(section.notes + "\n", encoding="utf-8", newline="\n")
     emit(
-        needs_calculation=existing is None, frozen=existing is not None and existing.stage == "frozen",
         version=section.version, tag_prefix=f"{cycle.action}/v",
         change_log_json=json.dumps(section.notes, ensure_ascii=True),
     )
@@ -632,7 +448,7 @@ def inputs(root: Path, _client: GitHub, path: Path) -> None:
 def calculate(root: Path, client: GitHub, path: Path) -> None:
     cycle = Cycle.environment()
     if path.exists():
-        raise ValueError("A recorded calculation must be reused, not overwritten.")
+        raise ValueError("A job-local calculation already exists; reconcile it manually.")
     if os.environ["RELEASE_RESULT"] != "SUCCESS":
         raise ValueError("Release calculation must return SUCCESS; FAILED/SKIPPED cannot publish.")
     section, changelog_digest, section_digest, _ = source_section(root, cycle)
@@ -648,6 +464,8 @@ def calculate(root: Path, client: GitHub, path: Path) -> None:
     )
     plan.validate()
     verify_ci(client, plan)
+    require_unstarted(root, cycle)
+    require_new_release(root, client, plan)
     save(path, plan)
     monorepo.release_preview(root)
 
@@ -719,6 +537,9 @@ def commit_file(root: Path, parent: str, filename: str, content: bytes, timestam
 
 def prepare(root: Path, _client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
+    if plan.stage != "calculated":
+        raise ValueError("Preparation requires a new calculation; reconcile repeated preparation manually.")
+    require_unstarted(root, plan.cycle)
     cleaned = check_source(root, plan)
     filename = f"{plan.cycle.action}/RELEASE-NOTES.md"
     entry = git(root, "ls-tree", plan.cycle.merge_sha, "--", filename).split()
@@ -740,9 +561,7 @@ def prepare(root: Path, _client: GitHub, path: Path) -> None:
         plan, stage="prepared", release_sha=release_sha,
         history_digest=digest(updated), cleanup_sha=cleanup_sha,
     )
-    if plan.stage != "calculated" and replace(prepared, stage=plan.stage) != plan:
-        raise ValueError("Reconstructed preparation does not match the saved commits.")
-    save(path, replace(prepared, stage=plan.stage) if plan.stage == "frozen" else prepared)
+    save(path, prepared)
     print(f"✅ Prepared {plan.tag}: merge {plan.cycle.merge_sha}, release {release_sha}.")
 
 
@@ -754,18 +573,6 @@ def remote_head(root: Path, branch: str) -> str:
     return result[0]
 
 
-def promotion(client: GitHub, plan: Plan):
-    matches = [
-        pr for pr in promotions(client, plan.cycle.action, plan.cycle.default_branch)
-        if plan.cycle.marker in (pr["body"] or "")
-    ]
-    if len(matches) > 1:
-        raise ValueError("Multiple promotion PRs identify this cycle; reconcile them manually.")
-    if matches and matches[0]["head"]["sha"] != plan.cleanup_sha:
-        raise ValueError("Promotion PR does not identify the recorded cleanup commit.")
-    return matches[0] if matches else None
-
-
 def release_record(client: GitHub, plan: Plan):
     record = client.optional(f"repos/{plan.cycle.repository}/releases/tags/{quote(plan.tag, safe='')}")
     if record is not None and (
@@ -775,6 +582,15 @@ def release_record(client: GitHub, plan: Plan):
     ):
         raise ValueError("An existing GitHub Release conflicts with the frozen plan.")
     return record
+
+
+def require_new_release(root: Path, client: GitHub, plan: Plan) -> None:
+    reference = f"refs/tags/{plan.tag}"
+    if (
+        release_record(client, plan) is not None
+        or git(root, "ls-remote", "--refs", "origin", reference)
+    ):
+        raise ValueError(f"{plan.tag} already exists; reconcile the release manually instead of retrying.")
 
 
 def require_published(root: Path, client: GitHub, plan: Plan) -> None:
@@ -796,41 +612,24 @@ def push_branch(root: Path, branch: str, expected: str, target: str) -> None:
 
 def push_notes(root: Path, client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
-    if plan.stage == "calculated":
-        raise ValueError("Release notes must be prepared and checkpointed before pushing.")
-    pr = promotion(client, plan)
-    if pr and pr["merged_at"] is not None:
-        require_published(root, client, plan)
-        return
-    head = remote_head(root, plan.cycle.branch)
-    if head == plan.release_sha:
-        print("ℹ️ Release-notes entry is already committed; skipping the update.")
-    elif head == plan.cleanup_sha:
-        require_published(root, client, plan)
-        print("ℹ️ Publication and cleanup already completed; reusing the recorded release.")
-    elif head == plan.cycle.merge_sha:
-        if plan.stage == "frozen":
-            raise ValueError("A frozen release branch was rewound; reconcile it manually.")
-        push_branch(root, plan.cycle.branch, head, plan.release_sha)
-    else:
-        raise ValueError("Release branch advanced unexpectedly; no release-notes update was pushed.")
+    if plan.stage != "prepared":
+        raise ValueError("Release notes must be prepared before pushing.")
+    require_unstarted(root, plan.cycle)
+    require_new_release(root, client, plan)
+    if plan.release_sha != plan.cycle.merge_sha:
+        push_branch(root, plan.cycle.branch, plan.cycle.merge_sha, plan.release_sha)
 
 
 def freeze(root: Path, client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
-    if plan.stage == "calculated":
+    if plan.stage != "prepared":
         raise ValueError("Cannot freeze before release-notes preparation.")
-    verify_source(client, plan.cycle)
     verify_ci(client, plan)
     fetch(root, plan.release_sha)
     content = run(root, "git", "show", f"{plan.release_sha}:{plan.cycle.action}/RELEASE-NOTES.md")
     if digest(content) != plan.history_digest:
         raise ValueError("Committed release notes do not match the prepared plan.")
-    pr = promotion(client, plan)
-    head = remote_head(root, plan.cycle.branch)
-    if pr and pr["merged_at"] is not None or head == plan.cleanup_sha:
-        require_published(root, client, plan)
-    elif head != plan.release_sha:
+    if remote_head(root, plan.cycle.branch) != plan.release_sha:
         raise ValueError("Release branch advanced before the plan could be frozen.")
     save(path, replace(plan, stage="frozen"))
 
@@ -844,71 +643,61 @@ def frozen(path: Path) -> Plan:
 
 def publish(root: Path, client: GitHub, path: Path) -> None:
     plan = frozen(path)
-    existing = release_record(client, plan)
-    pr = promotion(client, plan)
-    head = remote_head(root, plan.cycle.branch)
-    if head != plan.release_sha and not (
-        existing is not None and (head == plan.cleanup_sha or pr and pr["merged_at"] is not None)
-    ):
+    if remote_head(root, plan.cycle.branch) != plan.release_sha:
         raise ValueError("Release branch advanced before publication; no tags were pushed.")
+    require_new_release(root, client, plan)
     git(root, "fetch", "--quiet", "--tags", "--force", "origin")
     objects, commits = monorepo.tag_state(root, plan.cycle.action)
-    if existing is not None and plan.tag not in commits:
-        raise ValueError("GitHub Release exists without its exact tag; reconcile it manually.")
+    if plan.tag in objects:
+        raise ValueError("The full-version tag already exists; reconcile it manually.")
     targets = monorepo.release_targets(plan.cycle.action, plan.version, plan.release_sha, commits)
     monorepo.push_tags(root, targets, objects, plan.tag)
-    if existing is None:
-        existing = client.api(f"repos/{plan.cycle.repository}/releases", "POST", {
-            "tag_name": plan.tag, "target_commitish": plan.release_sha, "name": plan.tag,
-            "body": plan.release_notes, "draft": False, "prerelease": False, "make_latest": "false",
-        })
+    existing = client.api(f"repos/{plan.cycle.repository}/releases", "POST", {
+        "tag_name": plan.tag, "target_commitish": plan.release_sha, "name": plan.tag,
+        "body": plan.release_notes, "draft": False, "prerelease": False, "make_latest": "false",
+    })
     print(f"✅ Release: {existing['html_url']}")
 
 
 def cleanup(root: Path, client: GitHub, path: Path) -> None:
     plan = frozen(path)
     require_published(root, client, plan)
-    pr = promotion(client, plan)
-    if pr and pr["merged_at"] is not None:
-        return
     head = remote_head(root, plan.cycle.branch)
-    if head == plan.cleanup_sha:
-        print("ℹ️ Matching changelog cleanup is already committed.")
-    elif head == plan.release_sha:
-        push_branch(root, plan.cycle.branch, head, plan.cleanup_sha)
-    else:
-        raise ValueError("Release branch advanced; no changelog cleanup was pushed.")
+    if head != plan.release_sha:
+        raise ValueError("Release branch changed; reconcile cleanup manually.")
+    push_branch(root, plan.cycle.branch, head, plan.cleanup_sha)
 
 
 def promote(root: Path, client: GitHub, path: Path) -> None:
     plan = frozen(path)
     require_published(root, client, plan)
-    pr = promotion(client, plan)
-    if pr is None:
-        if remote_head(root, plan.cycle.branch) != plan.cleanup_sha:
-            raise ValueError("Promotion requires the recorded cleanup commit.")
-        if any(
-            item["state"] == "open"
-            for item in promotions(client, plan.cycle.action, plan.cycle.default_branch)
-        ):
-            raise ValueError("A different promotion PR is already open for this action.")
-        pr = client.api(f"repos/{plan.cycle.repository}/pulls", "POST", {
-            "title": f"Promote {plan.tag} to {plan.cycle.default_branch}",
-            "head": plan.cycle.branch, "base": plan.cycle.default_branch,
-            "body": (
-                f"{plan.cycle.marker}\n\nPromotes `{plan.tag}` and its release bookkeeping.\n\n"
-                f"- Source PR: #{plan.cycle.source_pr}\n"
-                f"- CI-tested merge: `{plan.cycle.merge_sha}`\n"
-                f"- Release commit: `{plan.release_sha}`\n"
-                f"- Changelog cleanup: `{plan.cleanup_sha}`\n\n"
-                "Merge manually after the required checks and reviews pass.\n"
-            ),
-        })
-        if pr["head"]["sha"] != plan.cleanup_sha:
-            raise ValueError("Promotion branch moved while the PR was being created.")
-    elif pr["state"] != "open" and pr["merged_at"] is None:
-        raise ValueError("The promotion PR was closed without merging; reopen it manually.")
+    next_steps = (
+        "If prompted, select 'Approve workflows to run' on the promotion PR to start CI. "
+        "Merge manually after the required checks and reviews pass."
+    )
+    if remote_head(root, plan.cycle.branch) != plan.cleanup_sha:
+        raise ValueError("Promotion requires the recorded cleanup commit.")
+    if any(
+        item["state"] == "open" or plan.cycle.marker in (item["body"] or "")
+        for item in promotions(client, plan.cycle.action, plan.cycle.default_branch)
+    ):
+        raise ValueError("A promotion PR already exists; reconcile it manually.")
+    pr = client.api(f"repos/{plan.cycle.repository}/pulls", "POST", {
+        "title": f"Promote {plan.tag} to {plan.cycle.default_branch}",
+        "head": plan.cycle.branch, "base": plan.cycle.default_branch,
+        "body": (
+            f"{plan.cycle.marker}\n\nPromotes `{plan.tag}` and its release bookkeeping.\n\n"
+            f"- Source PR: #{plan.cycle.source_pr}\n"
+            f"- CI-tested merge: `{plan.cycle.merge_sha}`\n"
+            f"- Release commit: `{plan.release_sha}`\n"
+            f"- Changelog cleanup: `{plan.cleanup_sha}`\n\n"
+            f"{next_steps}\n"
+        ),
+    })
+    if pr["head"]["sha"] != plan.cleanup_sha:
+        raise ValueError("Promotion branch moved while the PR was being created.")
     print(f"ℹ️ Promotion PR: {pr['html_url']}")
+    print(f"ℹ️ {next_steps}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary).open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(
@@ -916,18 +705,18 @@ def promote(root: Path, client: GitHub, path: Path) -> None:
                 f"CI-tested SHA: `{plan.cycle.merge_sha}`  \n"
                 f"Release SHA: `{plan.release_sha}`\n\n"
                 f"Promotion: {pr['html_url']}\n\n"
-                "Merge manually after required checks and reviews. No automatic merge is requested.\n"
+                f"{next_steps} No automatic merge is requested.\n"
             )
 
 
 def main() -> None:
     monorepo.configure_output()
     commands = {
-        "context": context, "restore": restore, "inputs": inputs, "calculate": calculate,
+        "context": context, "inputs": inputs, "calculate": calculate,
         "prepare": prepare, "push-notes": push_notes, "freeze": freeze, "publish": publish,
         "cleanup": cleanup, "promote": promote,
     }
-    parser = argparse.ArgumentParser(description="Run the pinned, resumable per-action release workflow.")
+    parser = argparse.ArgumentParser(description="Run a pinned per-action release; reconcile failures manually.")
     parser.add_argument("command", choices=commands)
     args = parser.parse_args()
     try:
@@ -935,7 +724,7 @@ def main() -> None:
             monorepo.ROOT, GitHub(monorepo.ROOT),
             Path(os.environ.get("RELEASE_STATE_FILE", "release-state.json")),
         )
-    except (ValueError, OSError, KeyError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
+    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         if isinstance(error, subprocess.CalledProcessError):
             detail = error.stderr or str(error)
             if isinstance(detail, bytes):

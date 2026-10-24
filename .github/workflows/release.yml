@@ -3,16 +3,6 @@ name: Release
 on:
   push:
     branches: ["release/**"]
-  workflow_dispatch:
-    inputs:
-      action:
-        description: Action whose interrupted release should be resumed
-        required: true
-        type: string
-      run-id:
-        description: Original Release push run ID, or a recovery run with saved state
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -24,7 +14,7 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 concurrency:
-  group: release-${{ github.event_name == 'push' && github.ref_name || format('release/{0}', inputs.action) }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -40,10 +30,6 @@ jobs:
       source-run-id: ${{ steps.gate.outputs.source-run-id }}
       source-pr: ${{ steps.gate.outputs.source-pr }}
       trusted-sha: ${{ steps.gate.outputs.trusted-sha }}
-      run-ci: ${{ steps.gate.outputs.run-ci }}
-      ci-run-id: ${{ steps.gate.outputs.ci-run-id }}
-      ci-run-attempt: ${{ steps.gate.outputs.ci-run-attempt }}
-      ci-target-sha: ${{ steps.gate.outputs.ci-target-sha }}
     steps:
       - name: Checkout trusted automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,21 +48,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh auth setup-git
-      - name: Verify release eligibility and recovery state
+      - name: Verify release eligibility
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CAPTURED_SHA: ${{ steps.context.outputs.target-sha }}
           CAPTURED_BRANCH: ${{ steps.context.outputs.action-target-branch }}
-          RECOVERY_ACTION: ${{ inputs.action }}
-          RECOVERY_RUN_ID: ${{ inputs.run-id }}
         run: python .github/scripts/release_workflow.py context
 
   CI:
     name: CI
     needs: CaptureContext
-    if: ${{ needs.CaptureContext.outputs.eligible == 'true' && needs.CaptureContext.outputs.run-ci == 'true' }}
+    if: ${{ needs.CaptureContext.outputs.eligible == 'true' }}
     uses: ./.github/workflows/ci.yml
     with:
       target-sha: ${{ needs.CaptureContext.outputs.merge-sha }}
@@ -91,10 +75,13 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.CaptureContext.result == 'success'
           && needs.CaptureContext.outputs.eligible == 'true'
-          && (needs.CI.result == 'success'
-              || (needs.CI.result == 'skipped' && needs.CaptureContext.outputs.run-ci == 'false')) }}
+          && needs.CI.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -114,25 +101,13 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Configure read-only Git access
+      - name: Configure release Git access
         run: gh auth setup-git
-      - name: Restore the latest release checkpoint
-        id: restore
-        run: python .github/scripts/release_workflow.py restore
-      - name: Save restored release plan
-        if: ${{ steps.restore.outputs.state-present == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-restored
-          path: release-state.json
-          archive: true
-          if-no-files-found: error
       - name: Select the pinned action section
         id: inputs
         run: python .github/scripts/release_workflow.py inputs
       - name: Calculate release version and notes
         id: semrelease
-        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
         uses: btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d # v5.1.0
         with:
           github-token: ${{ github.token }}
@@ -143,74 +118,23 @@ jobs:
           version: ${{ steps.inputs.outputs.version }}
           change-log: ${{ fromJSON(steps.inputs.outputs.change-log-json) }}
       - name: Validate and record the calculation
-        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
         env:
           RELEASE_RESULT: ${{ steps.semrelease.outputs.result }}
           RELEASE_VERSION: ${{ steps.semrelease.outputs.releaseVersion }}
           RELEASE_NOTES: ${{ steps.semrelease.outputs.releaseNotes }}
-          CI_RUN_ID: ${{ needs.CI.result == 'success' && github.run_id || needs.CaptureContext.outputs.ci-run-id }}
-          CI_RUN_ATTEMPT: ${{ needs.CI.result == 'success' && github.run_attempt || needs.CaptureContext.outputs.ci-run-attempt }}
-          CI_TARGET_SHA: ${{ needs.CI.outputs.target-sha || needs.CaptureContext.outputs.ci-target-sha }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_TARGET_SHA: ${{ needs.CI.outputs.target-sha }}
         run: python .github/scripts/release_workflow.py calculate
-      - name: Save calculated release plan
-        if: ${{ steps.inputs.outputs.needs-calculation == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-calculated
-          path: release-state.json
-          archive: true
-          if-no-files-found: error
       - name: Prepare the notes-only and cleanup commits
         run: python .github/scripts/release_workflow.py prepare
-      - name: Save prepared release plan
-        if: ${{ steps.inputs.outputs.frozen != 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-prepared
-          path: release-state.json
-          archive: true
-          if-no-files-found: error
-      - name: Require release automation credentials
-        env:
-          CLIENT_ID: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-        run: |
-          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
-            echo "::error::❌ Configure RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App."
-            exit 1
-          fi
-      - name: Create repository-scoped automation token
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-          permission-pull-requests: write
       - name: Commit the release-notes update
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: python .github/scripts/release_workflow.py push-notes
-      - name: Verify the committed release plan
-        run: python .github/scripts/release_workflow.py freeze
       - name: Freeze release plan
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-state-${{ env.ACTION_NAME }}-${{ env.MERGE_SHA }}-${{ github.run_attempt }}-frozen
-          path: release-state.json
-          archive: true
-          if-no-files-found: error
+        run: python .github/scripts/release_workflow.py freeze
       - name: Publish immutable release and compatibility aliases
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: python .github/scripts/release_workflow.py publish
       - name: Clean only the published changelog section
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: python .github/scripts/release_workflow.py cleanup
-      - name: Create or reuse the promotion PR for manual merge
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Create the promotion PR for manual merge
         run: python .github/scripts/release_workflow.py promote
