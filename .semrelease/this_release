@@ -5,6 +5,7 @@
 # or
 # #!<action-name>
 # Follow each header line with the list of changes for that release.
+# touch = 1
 
 #!workflow-context/v0.1.0
 - feat(action): capture workflow event, ref, and run metadata
