@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import monorepo
 import release_workflow as release
@@ -30,6 +30,7 @@ class FakeGitHub:
             "head": {"ref": f"dev/{cycle.action}"},
             "base": {"ref": cycle.branch, "repo": {"full_name": cycle.repository}},
         }
+        self.source_prs = {}
         self.jobs = {
             cycle.source_run_id: [
                 {
@@ -52,9 +53,26 @@ class FakeGitHub:
             attempt = int(path.split("/attempts/")[1].split("/")[0])
             return [job for job in self.jobs.get(run_id, []) if job["run_attempt"] == attempt]
         if "/commits/" in path and path.endswith("/pulls"):
-            return [self.source_pr]
+            commit = path.split("/commits/")[1].split("/")[0]
+            if commit == self.source_pr["merge_commit_sha"]:
+                return [self.source_pr]
+            return []
         if "/pulls?" in path:
-            return self.prs
+            query = parse_qs(urlsplit(path).query)
+            if "head" not in query and query["state"] == ["closed"]:
+                sources = [self.source_pr] + [
+                    pr for prs in self.source_prs.values() for pr in prs
+                ]
+                return [pr for pr in sources if pr["base"]["ref"] == query["base"][0]]
+            prs = [
+                pr for pr in self.prs
+                if pr["state"] == query["state"][0]
+                and pr["head"]["ref"] == query["head"][0].split(":", 1)[1]
+                and pr["base"]["ref"] == query["base"][0]
+            ]
+            for pr in prs:
+                pr["head"]["sha"] = release.remote_head(self.root, pr["head"]["ref"])
+            return prs
         raise AssertionError(f"Unexpected API listing: {path}")
 
     def api(self, path, method="GET", data=None):
@@ -67,13 +85,20 @@ class FakeGitHub:
             return record
         if method == "POST" and path.endswith("/pulls"):
             self.writes.append((path, data))
+            number = 30 + len(self.prs)
             pr = {
-                **data, "number": 30, "state": "open", "merged_at": None,
+                **data, "number": number, "state": "open", "merged_at": None,
                 "head": {"sha": release.remote_head(self.root, data["head"]), "ref": data["head"]},
                 "base": {"ref": data["base"]},
-                "html_url": f"https://github.com/{self.repository}/pull/30",
+                "html_url": f"https://github.com/{self.repository}/pull/{number}",
             }
             self.prs.append(pr)
+            return pr
+        if method == "PATCH" and "/pulls/" in path:
+            self.writes.append((path, data))
+            pr = next(pr for pr in self.prs if pr["number"] == int(path.rsplit("/", 1)[1]))
+            pr.update(data)
+            pr["head"]["sha"] = release.remote_head(self.root, pr["head"]["ref"])
             return pr
         raise AssertionError(f"Unexpected API call: {method} {path}")
 
@@ -157,6 +182,48 @@ class ReleaseFixture(unittest.TestCase):
         release.push_notes(self.root, self.client, self.path)
         release.freeze(self.root, self.client, self.path)
         return release.load(self.path, self.cycle)
+
+    def complete_release(self, promote=True):
+        plan = self.freeze()
+        release.publish(self.root, self.client, self.path)
+        release.cleanup(self.root, self.client, self.path)
+        if promote:
+            release.promote(self.root, self.client, self.path)
+        return plan
+
+    def start_cycle(self, parent, version="0.2.0"):
+        run_id = self.cycle.source_run_id + 1
+        merge = release.commit_file(
+            self.root, parent, ".semrelease/this_release",
+            (
+                "# Shared staging file\n\n#!other/v2.0.0\n- fix(action): preserve this section\n\n"
+                f"#!dummy\n- feat(action): next change {run_id}\n"
+            ).encode("utf-8"),
+            "2026-01-02T00:00:00+00:00", f"Next verified PR merge {run_id}\n",
+        )
+        release.push_branch(self.root, self.cycle.branch, parent, merge)
+        release.git(self.root, "checkout", "--quiet", "--detach", merge)
+        self.merge = merge
+        self.cycle = replace(
+            self.cycle, merge_sha=merge, source_run_id=run_id, source_pr=self.cycle.source_pr + 1,
+        )
+        self.path = self.parent / f"release-state-{run_id}.json"
+        self.client.runs[run_id] = {
+            **self.client.runs[run_id - 1], "id": run_id, "head_sha": merge,
+        }
+        self.client.source_prs[self.client.source_pr["merge_commit_sha"]] = [self.client.source_pr]
+        self.client.source_pr = {
+            **self.client.source_pr, "number": self.cycle.source_pr, "merge_commit_sha": merge,
+        }
+        self.client.jobs[run_id] = [dict(job) for job in self.client.jobs[run_id - 1]]
+        values = {
+            "GITHUB_RUN_ID": str(run_id), "SOURCE_RUN_ID": str(run_id),
+            "SOURCE_PR": str(self.cycle.source_pr), "CAPTURED_SHA": merge, "MERGE_SHA": merge,
+            "CI_RUN_ID": str(run_id), "CI_TARGET_SHA": merge,
+            "RELEASE_VERSION": version, "RELEASE_NOTES": f"### Features\n\n- Next release {run_id}",
+        }
+        self.environment.update(values)
+        os.environ.update(values)
 
     def remote_tag(self, name):
         value = release.git(self.root, "ls-remote", "--refs", "origin", f"refs/tags/{name}")
@@ -390,10 +457,39 @@ class ContextTests(ReleaseFixture):
             release.context(self.root, self.client, self.path)
             emit.assert_called_once_with(eligible=False)
 
-    def test_open_promotion_blocks_another_cycle(self):
+    def test_open_promotion_is_not_a_release_eligibility_gate(self):
         self.client.prs = [{"state": "open", "body": "Different cycle", "merged_at": None}]
-        with self.assertRaisesRegex(ValueError, "previous promotion"):
+        with patch("release_workflow.promotions", side_effect=AssertionError("Promotion is independent")):
+            with patch("release_workflow.emit") as emit:
+                release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_completed_publication_without_a_promotion_allows_another_cycle(self):
+        first = self.complete_release(promote=False)
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit:
             release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertFalse(self.client.prs)
+        self.assertEqual(release.remote_head(self.root, "main"), first.cycle.merge_sha)
+
+    def test_completed_noop_notes_publication_allows_another_cycle(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "0.0.1", "RELEASE_NOTES": "Old notes."}):
+            first = self.complete_release(promote=False)
+        self.assertEqual(first.release_sha, first.cycle.merge_sha)
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_legacy_tag_without_a_managed_release_merge_does_not_require_cleanup(self):
+        release.git(self.root, "tag", "dummy/v0.0.1", self.merge)
+        release.git(self.root, "push", "--quiet", "origin", "refs/tags/dummy/v0.0.1")
+        self.start_cycle(self.merge)
+        self.client.source_prs.clear()
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
 
     def test_retry_after_notes_push_requires_manual_reconciliation(self):
         self.prepare()
@@ -411,35 +507,178 @@ class ContextTests(ReleaseFixture):
         with self.assertRaisesRegex(ValueError, "already has a release tag"):
             release.context(self.root, self.client, self.path)
 
-    def test_completed_promotion_cannot_restart_the_same_cycle(self):
+    def test_published_cycle_cannot_restart_even_if_branch_is_rewound(self):
+        first = self.complete_release()
+        release.push_branch(self.root, self.cycle.branch, first.cleanup_sha, first.cycle.merge_sha)
+        self.client.prs[0]["body"] = None
+        with self.assertRaisesRegex(ValueError, "already has a tagged release.*manually"):
+            release.context(self.root, self.client, self.path)
+
+    def test_prior_notes_without_cleanup_block_another_cycle_even_with_a_promotion_marker(self):
+        first = self.freeze()
         self.client.prs = [{
             "state": "closed", "body": self.cycle.marker, "merged_at": "2026-01-01T00:00:00Z",
         }]
-        with self.assertRaisesRegex(ValueError, "already promoted.*manually"):
+        self.start_cycle(first.release_sha)
+        with self.assertRaisesRegex(ValueError, "still needs matching cleanup.*manually"):
             release.context(self.root, self.client, self.path)
+        self.assertFalse(self.client.writes)
 
-    def test_prior_bookkeeping_must_be_promoted_before_a_new_cycle(self):
-        previous = "a" * 40
-        newer = release.commit_file(
-            self.root, self.merge, "dummy/RELEASE-NOTES.md", b"# Previous bookkeeping\n",
-            "2026-01-01T00:00:00+00:00", f"Notes\n\nAction-Release: dummy@{previous}\n",
+    def test_prior_publication_without_cleanup_blocks_another_cycle(self):
+        first = self.freeze()
+        release.publish(self.root, self.client, self.path)
+        self.start_cycle(first.release_sha)
+        with self.assertRaisesRegex(ValueError, "still needs matching cleanup.*manually"):
+            release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_prior_noop_notes_publication_without_cleanup_blocks_another_cycle(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "0.0.1", "RELEASE_NOTES": "Old notes."}):
+            first = self.freeze()
+            release.publish(self.root, self.client, self.path)
+        self.assertEqual(first.release_sha, first.cycle.merge_sha)
+        self.start_cycle(first.release_sha)
+        with self.assertRaisesRegex(ValueError, "still needs matching cleanup.*manually"):
+            release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_prior_noop_notes_tags_without_a_release_block_another_cycle(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "0.0.1", "RELEASE_NOTES": "Old notes."}):
+            first = self.freeze()
+            error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"Network reset")
+            with patch.object(self.client, "api", side_effect=error):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.publish(self.root, self.client, self.path)
+        self.assertEqual(first.release_sha, first.cycle.merge_sha)
+        self.start_cycle(first.release_sha)
+        with self.assertRaisesRegex(ValueError, "still needs matching cleanup.*manually"):
+            release.context(self.root, self.client, self.path)
+        self.assertFalse(self.client.writes)
+
+    def test_prior_cleanup_without_a_published_release_blocks_another_cycle(self):
+        first = self.complete_release(promote=False)
+        del self.client.releases[first.tag]
+        self.start_cycle(first.cleanup_sha)
+        with self.assertRaisesRegex(ValueError, "Publication.*must complete"):
+            release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_prior_cleanup_with_a_missing_or_moved_full_tag_blocks_another_cycle(self):
+        first = self.complete_release(promote=False)
+        self.start_cycle(first.cleanup_sha)
+        release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{first.tag}")
+        with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
+            release.context(self.root, self.client, self.path)
+        release.git(
+            self.root, "push", "--quiet", "origin", f"{first.cycle.merge_sha}:refs/tags/{first.tag}",
         )
-        release.push_branch(self.root, self.cycle.branch, self.merge, newer)
-        self.client.runs[17]["head_sha"] = newer
-        self.client.source_pr["merge_commit_sha"] = newer
-        with patch.dict(os.environ, {"CAPTURED_SHA": newer}):
-            with self.assertRaisesRegex(ValueError, "not been promoted"):
+        with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
+            release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_prior_draft_or_prerelease_is_not_completed_publication(self):
+        first = self.complete_release(promote=False)
+        self.start_cycle(first.cleanup_sha)
+        for flag in ("draft", "prerelease"):
+            with (
+                self.subTest(flag=flag),
+                patch.dict(self.client.releases[first.tag], {flag: True}),
+                self.assertRaisesRegex(ValueError, "conflicts"),
+            ):
                 release.context(self.root, self.client, self.path)
-            self.client.prs = [{
-                "state": "closed", "body": f"<!-- action-release:dummy:{previous} -->",
-                "merged_at": "2026-01-01T00:00:00Z",
-            }]
-            with patch("release_workflow.emit") as emit:
-                release.context(self.root, self.client, self.path)
-            self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_merged_promotion_with_an_empty_body_does_not_block_another_cycle(self):
+        first = self.complete_release()
+        release.push_branch(self.root, "main", first.cycle.merge_sha, first.cleanup_sha)
+        self.client.prs[0].update(state="closed", body=None, merged_at="2026-01-01T00:00:00Z")
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_other_action_bookkeeping_does_not_gate_this_action(self):
+        staging = release.run(self.root, "git", "show", f"{self.merge}:.semrelease/this_release")
+        other = release.commit_file(
+            self.root, self.merge, ".semrelease/this_release", staging + b"\n# Other cleanup\n",
+            "2026-01-01T00:00:00+00:00",
+            "chore(action): clear released changelog entries\n\n"
+            f"Action-Release-Cleanup: other@{'a' * 40}\nRelease: other/v1.0.0\n",
+        )
+        release.push_branch(self.root, self.cycle.branch, self.merge, other)
+        self.start_cycle(other)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_copied_bookkeeping_in_a_squash_summary_is_not_a_new_release(self):
+        first = self.complete_release(promote=False)
+        notes = release.git(self.root, "log", "-1", "--format=%B", first.release_sha)
+        cleanup = release.git(self.root, "log", "-1", "--format=%B", first.cleanup_sha)
+        squash = release.commit_file(
+            self.root, first.cleanup_sha, "dummy/main.sh", b"echo integrated\n", first.timestamp,
+            f"Promotion squash summary\n\n{notes}\n\n{cleanup}\n",
+        )
+        release.push_branch(self.root, self.cycle.branch, first.cleanup_sha, squash)
+        self.start_cycle(squash)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
+    def test_manual_cleanup_can_follow_intervening_branch_changes(self):
+        first = self.freeze()
+        release.publish(self.root, self.client, self.path)
+        self.start_cycle(first.release_sha)
+        staging = release.run(self.root, "git", "show", f"{self.merge}:.semrelease/this_release")
+        reconciled = release.commit_file(
+            self.root, self.merge, ".semrelease/this_release", staging + b"\n# Manually reconciled\n",
+            first.timestamp, "chore(action): clear released changelog entries\n\n"
+            f"Action-Release-Cleanup: dummy@{first.cycle.merge_sha}\nRelease: {first.tag}\n"
+            "Signed-off-by: Test <test@example.invalid>\n",
+        )
+        release.push_branch(self.root, self.cycle.branch, self.merge, reconciled)
+        self.start_cycle(reconciled)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
 
 
 class ReleaseIntegrationTests(ReleaseFixture):
+    def test_two_releases_before_main_promotion_reuse_one_cumulative_pr(self):
+        first = self.complete_release()
+        pr = self.client.prs[0]
+        pr["body"] += "\nHuman review note: keep this description.\n"
+        original_body = pr["body"]
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        second = self.complete_release()
+        self.assertEqual(len(self.client.prs), 1)
+        self.assertEqual(self.client.prs[0]["number"], pr["number"])
+        self.assertEqual(pr["title"], "Promote dummy to main")
+        self.assertEqual(pr["head"]["sha"], second.cleanup_sha)
+        self.assertTrue(pr["body"].startswith(original_body))
+        for plan in (first, second):
+            self.assertIn(plan.tag, pr["body"])
+            self.assertIn(plan.release_sha, pr["body"])
+            self.assertIn(plan.cleanup_sha, pr["body"])
+            self.assertEqual(self.remote_tag(plan.tag), plan.release_sha)
+        for alias in ("dummy/v0", "dummy/v0.2"):
+            self.assertEqual(self.remote_tag(alias), second.release_sha)
+        self.assertEqual(self.remote_tag("dummy/v0.1"), first.release_sha)
+        self.assertEqual(release.remote_head(self.root, "main"), first.cycle.merge_sha)
+        self.assertEqual(release.remote_head(self.root, "release/dummy"), second.cleanup_sha)
+        history = release.run(self.root, "git", "show", f"{second.release_sha}:dummy/RELEASE-NOTES.md")
+        self.assertLess(history.index(b"## v0.2.0"), history.index(b"## v0.1.0"))
+        self.assertEqual(history.count(b"## v0.1.0\n"), 1)
+        cleaned = release.run(self.root, "git", "show", f"{second.cleanup_sha}:.semrelease/this_release")
+        self.assertNotIn(b"#!dummy", cleaned)
+        self.assertIn(b"#!other/v2.0.0\n- fix(action): preserve this section\n", cleaned)
+        self.assertEqual(
+            [path.rsplit("/", 1)[-1] for path, _ in self.client.writes],
+            ["releases", "pulls", "releases", str(pr["number"])],
+        )
+
     def test_complete_release_preserves_code_other_sections_and_manual_merge(self):
         self.path = self.root / "release-state.json"
         release.inputs(self.root, self.client, self.path)
@@ -646,23 +885,74 @@ class ReleaseIntegrationTests(ReleaseFixture):
             push.assert_not_called()
         self.assertEqual(release.remote_head(self.root, self.cycle.branch), plan.cleanup_sha)
 
-    def test_existing_promotion_is_never_reused_or_duplicated(self):
-        self.freeze()
-        release.publish(self.root, self.client, self.path)
-        release.cleanup(self.root, self.client, self.path)
+    def test_existing_open_promotion_is_reused_without_duplicate_metadata_or_writes(self):
+        self.complete_release()
+        body = self.client.prs[0]["body"]
         release.promote(self.root, self.client, self.path)
-        for state, merged in (("open", None), ("closed", None), ("closed", "2026-01-01T00:00:00Z")):
-            self.client.prs[0].update(state=state, merged_at=merged)
-            with self.subTest(state=state, merged=merged):
-                with self.assertRaisesRegex(ValueError, "already exists.*manually"):
-                    release.promote(self.root, self.client, self.path)
         self.assertEqual(len(self.client.prs), 1)
         self.assertEqual(len(self.client.writes), 2)
+        self.assertEqual(self.client.prs[0]["body"], body)
+        self.assertEqual(body.count(self.cycle.marker), 1)
 
-    def test_promotion_creation_network_failure_is_not_retried(self):
-        self.freeze()
-        release.publish(self.root, self.client, self.path)
-        release.cleanup(self.root, self.client, self.path)
+    def test_manual_open_promotion_keeps_human_description_without_a_cycle_marker(self):
+        self.complete_release(promote=False)
+        body = "Human promotion description.\n\nDo not remove these review instructions.\n"
+        self.client.api(f"repos/{self.cycle.repository}/pulls", "POST", {
+            "title": "Manual promotion", "head": self.cycle.branch,
+            "base": self.cycle.default_branch, "body": body,
+        })
+        for description in (body, "", None):
+            self.client.prs[0]["body"] = description
+            with self.subTest(description=description):
+                release.promote(self.root, self.client, self.path)
+                self.assertEqual(len(self.client.prs), 1)
+                self.assertTrue(self.client.prs[0]["body"].startswith(description or ""))
+                self.assertIn(self.cycle.marker, self.client.prs[0]["body"])
+                self.assertEqual(self.client.prs[0]["title"], "Promote dummy to main")
+
+    def test_closed_or_merged_promotions_allow_a_new_pr_for_a_later_release(self):
+        first = self.complete_release()
+        self.client.prs[0].update(state="closed", body=None)
+        self.start_cycle(first.cleanup_sha)
+        second = self.complete_release()
+        self.client.prs[1].update(state="closed", body=None, merged_at="2026-01-01T00:00:00Z")
+        self.start_cycle(second.cleanup_sha, version="0.3.0")
+        third = self.complete_release()
+        self.assertEqual(len(self.client.prs), 3)
+        self.assertEqual(sum(pr["state"] == "open" for pr in self.client.prs), 1)
+        self.assertEqual(self.client.prs[-1]["head"]["sha"], third.cleanup_sha)
+        self.assertEqual(self.client.prs[-1]["number"], 32)
+
+    def test_multiple_open_promotions_fail_without_creating_or_updating_a_pr(self):
+        self.complete_release()
+        self.client.prs.append({**self.client.prs[0], "number": 31})
+        with self.assertRaisesRegex(ValueError, "Multiple open promotion PRs"):
+            release.promote(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 2)
+
+    def test_branch_movement_during_promotion_update_fails_without_another_pr(self):
+        first = self.complete_release()
+        self.start_cycle(first.cleanup_sha)
+        second = self.complete_release(promote=False)
+        moved = release.commit_file(
+            self.root, second.cleanup_sha, "dummy/main.sh", b"echo other work\n",
+            second.timestamp, "Other work\n",
+        )
+        original = self.client.api
+
+        def move_branch(path, method="GET", data=None):
+            if method == "PATCH":
+                release.push_branch(self.root, self.cycle.branch, second.cleanup_sha, moved)
+            return original(path, method, data)
+
+        with patch.object(self.client, "api", side_effect=move_branch):
+            with self.assertRaisesRegex(ValueError, "changed during the handoff.*manually"):
+                release.promote(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.prs), 1)
+        self.assertEqual(release.remote_head(self.root, self.cycle.branch), moved)
+
+    def test_promotion_creation_network_failure_surfaces_without_creating_a_duplicate(self):
+        self.complete_release(promote=False)
         original = self.client.api
 
         def lost_response(path, method="GET", data=None):
@@ -674,13 +964,23 @@ class ReleaseIntegrationTests(ReleaseFixture):
         with patch.object(self.client, "api", side_effect=lost_response):
             with self.assertRaises(subprocess.CalledProcessError):
                 release.promote(self.root, self.client, self.path)
-        with self.assertRaisesRegex(ValueError, "already exists.*manually"):
-            release.promote(self.root, self.client, self.path)
+        release.promote(self.root, self.client, self.path)
         self.assertEqual(len(self.client.prs), 1)
         self.assertEqual(len(self.client.writes), 2)
 
 
 class GitHubClientTests(ReleaseFixture):
+    def test_ancestry_lookup_only_treats_exit_one_as_a_negative_result(self):
+        with patch("release_workflow.git", return_value=""):
+            self.assertTrue(release.is_ancestor(self.root, self.merge, self.merge))
+        error = subprocess.CalledProcessError(1, ["git", "merge-base"])
+        with patch("release_workflow.git", side_effect=error):
+            self.assertFalse(release.is_ancestor(self.root, self.merge, self.merge))
+        error = subprocess.CalledProcessError(128, ["git", "merge-base"], stderr=b"Invalid object")
+        with patch("release_workflow.git", side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.is_ancestor(self.root, self.merge, self.merge)
+
     def test_only_explicit_http_404_is_treated_as_missing_release(self):
         client = release.GitHub(self.root)
         for status in (403, 429, 500):
@@ -792,7 +1092,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "Prepare the notes-only and cleanup commits", "Commit the release-notes update",
             "Freeze release plan",
             "Publish immutable release and compatibility aliases",
-            "Clean only the published changelog section", "Create the promotion PR for manual merge",
+            "Clean only the published changelog section", "Create or update the promotion PR for manual merge",
         ]
         positions = [self.steps.index(self.named[name]) for name in required]
         self.assertEqual(positions, sorted(positions))
@@ -832,7 +1132,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(token, "${{ github.token }}")
         for name in (
             "Commit the release-notes update", "Publish immutable release and compatibility aliases",
-            "Clean only the published changelog section", "Create the promotion PR for manual merge",
+            "Clean only the published changelog section", "Create or update the promotion PR for manual merge",
         ):
             self.assertEqual(self.named[name].get("env", {}).get("GH_TOKEN", token), "${{ github.token }}")
         git_access = self.named["Configure release Git access"]
