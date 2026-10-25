@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -12,9 +13,55 @@ ACTION_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
+def configure_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors=stream.errors)
+
+
 def validate_name(name: str) -> None:
     if not ACTION_NAME.fullmatch(name):
         raise ValueError("Action names must use lowercase kebab-case.")
+
+
+def validate_release_pr_branches(source_branch: str, target_branch: str) -> bool:
+    if (
+        not isinstance(source_branch, str) or not source_branch
+        or not isinstance(target_branch, str) or not target_branch
+    ):
+        raise ValueError("PR source and target branches must be nonempty strings.")
+    if not target_branch.startswith("release/"):
+        return False
+    target_action = target_branch.removeprefix("release/")
+    if not ACTION_NAME.fullmatch(target_action):
+        raise ValueError(
+            f"Invalid release PR target branch {target_branch!r}; "
+            "expected release/<action> with a lowercase kebab-case action name."
+        )
+    prefix, separator, source_action = source_branch.partition("/")
+    if not prefix or not separator or not ACTION_NAME.fullmatch(source_action):
+        raise ValueError(
+            f"PR source branch {source_branch!r} must use <prefix>/{target_action} "
+            f"when targeting {target_branch!r}."
+        )
+    if source_action != target_action:
+        raise ValueError(
+            f"PR action mismatch: {source_branch!r} targets {target_branch!r}; "
+            "both must name the same action."
+        )
+    return True
+
+
+def validate_pr_branches(_root: Path) -> None:
+    required = ("PR_HEAD_REF", "PR_BASE_REF")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise ValueError(f"Missing PR branch environment variables: {', '.join(missing)}.")
+    source, target = (os.environ[name] for name in required)
+    if validate_release_pr_branches(source, target):
+        print(f"✅ Release PR branches match: {source!r} -> {target!r}.", flush=True)
+    else:
+        print(f"ℹ️ PR target {target!r} is not a release branch; branch pairing check skipped.", flush=True)
 
 
 def parse_version(value: str) -> tuple[int, int, int]:
@@ -36,7 +83,7 @@ def actions(root: Path) -> list[Path]:
         if not (directory / "action.yml").exists():
             continue
         validate_name(directory.name)
-        for filename in ("action.yml", "README.md", "tests/run.sh"):
+        for filename in ("action.yml", "README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             if not (directory / filename).is_file():
                 raise ValueError(f"{directory.name}: missing {filename}.")
         result.append(directory)
@@ -59,8 +106,11 @@ def validate(root: Path) -> None:
     if action_files:
         groups.append(("github-actions", action_files))
     else:
-        print("No actions found; action metadata validation is not yet applicable.")
+        print("ℹ️ No actions found; action metadata validation is not yet applicable.")
     for schema, files in groups:
+        print(f"ℹ️ Validating {schema}:", flush=True)
+        for path in files:
+            print(f"  - {path.relative_to(root).as_posix()}", flush=True)
         subprocess.run(
             [sys.executable, "-m", "check_jsonschema", "--builtin-schema",
              f"vendor.{schema}", *map(str, files)],
@@ -72,7 +122,7 @@ def validate(root: Path) -> None:
 def test_actions(root: Path) -> None:
     directories = actions(root)
     if not directories:
-        print("No actions found; action tests will run when the first action is added.")
+        print("ℹ️ No actions found; action tests will run when the first action is added.")
         return
     bash = "bash"
     if sys.platform == "win32":
@@ -85,7 +135,7 @@ def test_actions(root: Path) -> None:
             )
         bash = str(native)
     for directory in directories:
-        print(f"Testing {directory.name}", flush=True)
+        print(f"ℹ️ Testing {directory.name}", flush=True)
         subprocess.run([bash, "tests/run.sh"], cwd=directory, check=True)
 
 
@@ -97,6 +147,12 @@ class ReleaseSection:
     line: int
 
 
+class ChangelogError(ValueError):
+    def __init__(self, message: str, warnings: list[tuple[int, str]]) -> None:
+        super().__init__(message)
+        self.warnings = warnings
+
+
 def parse_changelog(
     text: str, known_actions: set[str], selected_action: str | None = None
 ) -> tuple[list[ReleaseSection], list[tuple[int, str]]]:
@@ -106,6 +162,7 @@ def parse_changelog(
     ]
     sections = []
     warnings = []
+    header_lines: dict[str, list[int]] = {}
     if selected_action is None:
         for index in range(headers[0] if headers else len(lines)):
             if lines[index].strip() and not lines[index].lstrip().startswith("#"):
@@ -120,55 +177,78 @@ def parse_changelog(
             candidate is None or candidate[1] != selected_action
         ):
             continue
-        match = re.fullmatch(r"#! *([^/\s]+)/v(\S+)", header.rstrip())
+        match = re.fullmatch(r"#! *([^/\s]+)(?:/v(\S+))?", header.rstrip())
         if not match:
             warnings.append((
                 index + 1,
                 f"Invalid release section header {header!r}; "
-                "expected #!<action-name>/v<version-number>.",
+                "expected #!<action-name> or #!<action-name>/v<version-number>.",
             ))
             continue
-        action, version = match.groups()
+        action = match[1]
+        version = match[2] or ""
         try:
             validate_name(action)
-            parse_version(version)
+            if version:
+                parse_version(version)
         except ValueError as error:
             warnings.append((index + 1, f"Invalid release section {header!r}: {error}"))
             continue
         if action not in known_actions:
             warnings.append((index + 1, f"Unknown action {action!r}: no action.yml found."))
             continue
+        header_lines.setdefault(action, []).append(index + 1)
         end = headers[position + 1] if position + 1 < len(headers) else len(lines)
         notes = "\n".join(
             line for line in lines[index + 1:end] if not line.lstrip().startswith("#")
         ).strip("\n")
         if not notes.strip():
-            warnings.append((index + 1, f"Release section {action}/v{version} has no changelog entries."))
+            label = f"{action}/v{version}" if version else action
+            warnings.append((index + 1, f"Release section {label} has no changelog entries."))
             continue
         sections.append(ReleaseSection(action, version, notes, index + 1))
-    counts = {}
-    for section in sections:
-        counts[section.action] = counts.get(section.action, 0) + 1
-    for section in sections:
-        if counts[section.action] > 1:
-            warnings.append((
-                section.line,
-                f"Multiple release sections for action {section.action!r}; "
-                "keep exactly one pending version per action.",
-            ))
-    return [
-        section for section in sections if counts[section.action] == 1
-    ], sorted(warnings)
+    duplicates = [
+        f"Multiple release sections for action {action!r} at lines "
+        f"{', '.join(map(str, positions))}; keep exactly one section per action."
+        for action, positions in header_lines.items() if len(positions) > 1
+    ]
+    warnings.sort()
+    if duplicates:
+        raise ChangelogError("\n".join(duplicates), warnings)
+    return sections, warnings
+
+
+def print_changelog_warnings(warnings: list[tuple[int, str]]) -> None:
+    for line, message in warnings:
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::warning file=.semrelease/this_release,line={line}::⚠️ {escaped}", flush=True)
+
+
+def load_changelog(
+    root: Path, selected_action: str | None = None
+) -> tuple[list[ReleaseSection], list[tuple[int, str]]]:
+    try:
+        return parse_changelog(
+            (root / ".semrelease" / "this_release").read_text(encoding="utf-8-sig"),
+            {directory.name for directory in actions(root)},
+            selected_action,
+        )
+    except ChangelogError as error:
+        print_changelog_warnings(error.warnings)
+        raise
+
+
+def validate_changelog(root: Path) -> None:
+    sections, warnings = load_changelog(root)
+    print_changelog_warnings(warnings)
+    print(f"✅ Changelog validation passed ({len(sections)} non-empty sections).", flush=True)
 
 
 def changelog(root: Path) -> None:
     branch = os.environ.get("CHANGELOG_BRANCH", "")
-    selected_action = branch[len("release/"):] if branch.startswith("release/") else None
-    sections, warnings = parse_changelog(
-        (root / ".semrelease" / "this_release").read_text(encoding="utf-8-sig"),
-        {directory.name for directory in actions(root)},
-        selected_action,
-    )
+    prefix, separator, action = branch.partition("/")
+    selected_action = action if separator and prefix else None
+    sections, warnings = load_changelog(root, selected_action)
     if selected_action is not None and not sections:
         warnings.append((
             1,
@@ -177,7 +257,7 @@ def changelog(root: Path) -> None:
         ))
     scope = f"action {selected_action!r}" if selected_action is not None else "all actions"
     report = [
-        f"Branch: {branch or '(not a branch)'}",
+        f"ℹ️ Branch: {branch or '(not a branch)'}",
         f"Release scope: {scope}",
         f"Pending releases: {len(sections)}",
     ]
@@ -185,22 +265,70 @@ def changelog(root: Path) -> None:
         report.extend((
             "",
             f"Action: {section.action}",
-            f"Version: {section.version}",
-            f"Tag: {section.action}/v{section.version}",
+            f"Version: {section.version or '(automatic)'}",
+            f"Tag prefix: {section.action}/v",
             "Changelog:",
             section.notes,
         ))
-    output = "\n".join(report)
+    print_workflow_data("\n".join(report))
+    print_changelog_warnings(warnings)
+    if output_path := os.environ.get("GITHUB_OUTPUT"):
+        matrix = {"include": [
+            {
+                "action": section.action,
+                "version": section.version,
+                "tag-prefix": f"{section.action}/v",
+                "change-log": section.notes,
+            }
+            for section in sections
+        ]}
+        with Path(output_path).open("a", encoding="utf-8", newline="\n") as output:
+            output.write(f"matrix={json.dumps(matrix, ensure_ascii=True)}\n")
+            output.write(f"has-releases={'true' if sections else 'false'}\n")
+
+
+def print_workflow_data(output: str) -> None:
     token = uuid.uuid4().hex
     while token in output:
         token = uuid.uuid4().hex
-    # Release notes must be printed as data, not interpreted as runner commands.
+    # Reports may contain untrusted messages, not runner commands.
     print(f"::stop-commands::{token}", flush=True)
     print(output, flush=True)
     print(f"::{token}::", flush=True)
-    for line, message in warnings:
-        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::warning file=.semrelease/this_release,line={line}::{escaped}", flush=True)
+
+
+def release_preview(_root: Path) -> None:
+    required = ("ACTION_NAME", "RELEASE_RESULT", "RELEASE_VERSION", "RELEASE_NOTES")
+    missing = [name for name in required if name not in os.environ]
+    if missing:
+        raise ValueError(f"Missing release preview environment variables: {', '.join(missing)}.")
+    action = os.environ["ACTION_NAME"]
+    validate_name(action)
+    result = os.environ["RELEASE_RESULT"]
+    version = os.environ["RELEASE_VERSION"]
+    notes = os.environ["RELEASE_NOTES"]
+    if result not in ("SUCCESS", "SKIPPED", "FAILED"):
+        raise ValueError(f"Invalid release preview result: {result!r}.")
+    if result == "SUCCESS" and (not version.strip() or not notes.strip()):
+        raise ValueError("A successful release preview must include releaseVersion and releaseNotes.")
+    icon = {"SUCCESS": "✅", "SKIPPED": "ℹ️", "FAILED": "❌"}[result]
+    print_workflow_data("\n".join((
+        f"{icon} Action: {action}",
+        f"result: {result}",
+        f"releaseVersion: {version}",
+        "releaseNotes:",
+        notes,
+    )))
+    if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(summary_path).open("a", encoding="utf-8", newline="\n") as summary:
+            summary.write(
+                f"## {icon} Release preview: `{action}`\n\n"
+                f"- result: `{result}`\n"
+                f"- releaseVersion: `{version}`\n\n"
+                f"### releaseNotes\n\n{notes}\n\n"
+            )
+    if result == "FAILED":
+        raise ValueError(f"Release preview for {action} failed; see action-semrelease logs.")
 
 
 def capture(root: Path, *command: str, stdin: str | None = None) -> str:
@@ -260,7 +388,7 @@ def push_tags(
         if (name != exact or name not in objects) and objects.get(name) != commit
     }
     if not updates:
-        print("Release tags already match; completing the missing GitHub release.")
+        print("ℹ️ Release tags already match; no tag updates are needed.")
         return
     leases = [
         f"--force-with-lease=refs/tags/{name}:{objects.get(name, '')}"
@@ -302,9 +430,9 @@ def release(root: Path) -> None:
     objects, commits = tag_state(root, action)
     targets = release_targets(action, version, commit, commits)
     for name, target in targets.items():
-        print(f"{name} -> {target}", flush=True)
+        print(f"ℹ️ {name} -> {target}", flush=True)
     push_tags(root, targets, objects, exact)
-    print(capture(
+    print("✅ Release: " + capture(
         root, "gh", "release", "create", exact, "--repo", repository,
         "--verify-tag", "--title", exact, "--notes-file", "-", "--latest=false",
         stdin=os.environ["RELEASE_NOTES"],
@@ -312,19 +440,28 @@ def release(root: Path) -> None:
 
 
 def main() -> None:
+    configure_output()
     parser = argparse.ArgumentParser(
-        description="Validate, test, inspect changelogs, or release this action monorepo."
+        description="Validate, test, plan or preview releases, or release this action monorepo."
     )
-    parser.add_argument("command", choices=("validate", "test", "changelog", "release"))
+    parser.add_argument(
+        "command", choices=(
+            "validate", "test", "validate-pr-branches", "validate-changelog", "changelog",
+            "release-preview", "release",
+        ),
+    )
     args = parser.parse_args()
     try:
         {
-            "validate": validate, "test": test_actions, "changelog": changelog, "release": release,
+            "validate": validate, "test": test_actions,
+            "validate-pr-branches": validate_pr_branches,
+            "validate-changelog": validate_changelog, "changelog": changelog,
+            "release-preview": release_preview, "release": release,
         }[args.command](ROOT)
     except (ValueError, FileNotFoundError) as error:
-        parser.exit(1, f"error: {error}\n")
+        parser.exit(1, f"❌ error: {error}\n")
     except subprocess.CalledProcessError as error:
-        parser.exit(1, f"error: {error.stderr or str(error)}\n")
+        parser.exit(1, f"❌ error: {error.stderr or str(error)}\n")
 
 
 if __name__ == "__main__":

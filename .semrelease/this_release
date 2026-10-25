@@ -1,9 +1,16 @@
-# This file has been cleaned up post-releasing version 0.0.0.
-# Generate its content quickly using the following command:
-#   git log origin..HEAD | grep "^\s" > .semrelease/this_release
+# This file contains custom changelog entries for the upcoming releases.
+# Each upcoming release per action is documented under its respective section.
+# Each section has one header line in the following format
+# #!<action-name>/v<version-number>
+# or
+# #!<action-name>
+# Follow each header line with the list of changes for that release.
 
 #!workflow-context/v0.1.0
 - feat(action): capture workflow event, ref, and run metadata
 - feat(action): capture PR details with optional API enrichment
 - feat(action): support target SHA overrides
 - feat(action): expose typed JSON context alongside individual outputs
+
+#!dummy
+- feat(action): print touch value with the testing-only message

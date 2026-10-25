@@ -2,16 +2,35 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: ["**", "!release/**"]
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      target-sha:
+        description: Immutable commit to validate
+        type: string
+        default: ""
+      target-branch:
+        description: Branch used to select the pending action
+        type: string
+        default: ""
+      skip-release-preview:
+        description: Let the release workflow calculate only after CI succeeds
+        type: boolean
+        default: false
+    outputs:
+      target-sha:
+        description: Commit actually selected for validation
+        value: ${{ jobs.CaptureContext.outputs.target-sha }}
 
 permissions:
   contents: read
 
 env:
   PYTHON_VERSION: "3.12"
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   CaptureContext:
@@ -20,30 +39,69 @@ jobs:
     timeout-minutes: 5
     outputs:
       target-sha: ${{ steps.context.outputs.target-sha }}
-      action-target-branch: ${{ steps.context.outputs.action-target-branch }}
+      action-target-branch: ${{ inputs.target-branch || steps.context.outputs.action-target-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.target-sha || github.sha }}
           persist-credentials: false
       - name: Capture workflow context
         id: context
         uses: ./workflow-context
+        with:
+          target-sha: ${{ inputs.target-sha }}
       - name: Print workflow context
         env:
           EVENT_NAME: ${{ steps.context.outputs.event-name }}
           TARGET_SHA: ${{ steps.context.outputs.target-sha }}
-          TARGET_BRANCH: ${{ steps.context.outputs.action-target-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch || steps.context.outputs.action-target-branch }}
           PR_NUMBER: ${{ steps.context.outputs.pr-number }}
         run: |
-          printf 'Event: %s\n' "$EVENT_NAME"
-          printf 'Target SHA: %s\n' "$TARGET_SHA"
-          printf 'Target branch: %s\n' "$TARGET_BRANCH"
-          printf 'PR number: %s\n' "$PR_NUMBER"
+          printf 'ℹ️ Event: %s\n' "$EVENT_NAME"
+          printf 'ℹ️ Target SHA: %s\n' "$TARGET_SHA"
+          printf 'ℹ️ Target branch: %s\n' "$TARGET_BRANCH"
+          printf 'ℹ️ PR number: %s\n' "$PR_NUMBER"
 
   ParseChangelog:
     name: Parse release changelog
     needs: CaptureContext
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.changelog.outputs.matrix }}
+      has-releases: ${{ steps.changelog.outputs.has-releases }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.CaptureContext.outputs.target-sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate release PR branch pairing
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PR_HEAD_REF: ${{ github.head_ref }}
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: python .github/scripts/monorepo.py validate-pr-branches
+      - name: Validate changelog
+        run: python .github/scripts/monorepo.py validate-changelog
+      - name: Report pending releases
+        id: changelog
+        env:
+          CHANGELOG_BRANCH: ${{ inputs.target-branch || github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
+        run: python .github/scripts/monorepo.py changelog
+
+  PreviewRelease:
+    name: Preview release (action - ${{ matrix.action }})
+    needs: [CaptureContext, ParseChangelog]
+    if: ${{ !inputs.skip-release-preview && needs.ParseChangelog.outputs.has-releases == 'true' && github.event.deleted != true }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.ParseChangelog.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -56,10 +114,54 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Report pending releases
+      - name: Calculate release version and notes
+        id: semrelease
+        uses: btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d # v5.1.0
+        with:
+          github-token: ${{ github.token }}
+          dry-run: true
+          target-sha: ${{ needs.CaptureContext.outputs.target-sha }}
+          branches: ${{ github.ref }}
+          tag-prefix: ${{ matrix.tag-prefix }}
+          version: ${{ matrix.version }}
+          change-log: ${{ matrix.change-log }}
+      - name: Report release preview
+        if: ${{ !cancelled() && (steps.semrelease.outcome == 'success' || steps.semrelease.outcome == 'failure') }}
         env:
-          CHANGELOG_BRANCH: ${{ github.base_ref || needs.CaptureContext.outputs.action-target-branch }}
-        run: python .github/scripts/monorepo.py changelog
+          ACTION_NAME: ${{ matrix.action }}
+          RELEASE_RESULT: ${{ steps.semrelease.outputs.result }}
+          RELEASE_VERSION: ${{ steps.semrelease.outputs.releaseVersion }}
+          RELEASE_NOTES: ${{ steps.semrelease.outputs.releaseNotes }}
+        run: python .github/scripts/monorepo.py release-preview
+
+  PreviewReleasePass:
+    name: PreviewReleasePass
+    needs: [ParseChangelog, PreviewRelease]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful release previews or an intentional skip
+        shell: bash
+        env:
+          CHANGELOG_RESULT: ${{ needs.ParseChangelog.result }}
+          PREVIEW_RESULT: ${{ needs.PreviewRelease.result }}
+          SKIP_EXPECTED: ${{ inputs.skip-release-preview || needs.ParseChangelog.outputs.has-releases == 'false' || github.event.deleted == true }}
+        run: |
+          if [ "$CHANGELOG_RESULT" != "success" ]; then
+            echo "::error::❌ ParseChangelog completed with result '$CHANGELOG_RESULT'; expected success."
+            exit 1
+          fi
+          if [ "$PREVIEW_RESULT" = "success" ]; then
+            echo "✅ All release previews passed."
+            exit 0
+          fi
+          if [ "$PREVIEW_RESULT" = "skipped" ] && [ "$SKIP_EXPECTED" = "true" ]; then
+            echo "ℹ️ Release preview was intentionally skipped."
+            exit 0
+          fi
+          echo "::error::❌ PreviewRelease completed with result '$PREVIEW_RESULT'; expected success or an intentional skip."
+          exit 1
 
   Validate:
     name: Validate and test (${{ matrix.os }})
@@ -98,3 +200,21 @@ jobs:
         run: python .github/scripts/monorepo.py test
       - name: Check tracked generated files
         run: git diff --exit-code HEAD --
+
+  ValidatePass:
+    name: ValidatePass
+    needs: Validate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful validation
+        shell: bash
+        env:
+          JOB_RESULT: ${{ needs.Validate.result }}
+        run: |
+          if [ "$JOB_RESULT" != "success" ]; then
+            echo "::error::❌ Validate completed with result '$JOB_RESULT'; expected success."
+            exit 1
+          fi
+          echo "✅ All validation jobs passed."
