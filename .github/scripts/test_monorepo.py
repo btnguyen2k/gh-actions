@@ -1060,7 +1060,7 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.preview)
 
 
-class CIMarkerWorkflowTests(unittest.TestCase):
+class CIWorkflowTestCase(unittest.TestCase):
     def setUp(self):
         from ruamel.yaml import YAML
 
@@ -1076,15 +1076,123 @@ class CIMarkerWorkflowTests(unittest.TestCase):
             self.assertTrue(native.is_absolute() and native.is_file())
             self.bash = str(native)
 
-    def run_marker(self, name, environment):
+    def run_step(self, step, environment):
         return subprocess.run(
             [
                 self.bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
-                self.jobs[name]["steps"][0]["run"],
+                step["run"],
             ],
             cwd=monorepo.ROOT, env={**os.environ, **environment},
             capture_output=True, encoding="utf-8", check=False, timeout=10,
         )
+
+
+class CIContextWorkflowTests(CIWorkflowTestCase):
+    def setUp(self):
+        super().setUp()
+        self.step = next(
+            step for step in self.jobs["CaptureContext"]["steps"]
+            if step.get("name") == "Print workflow context"
+        )
+
+    def test_binds_context_fields_without_changing_outputs_or_release_scope(self):
+        self.assertEqual(self.step["shell"], "bash")
+        self.assertNotIn("${{", self.step["run"])
+        self.assertEqual(self.jobs["CaptureContext"]["outputs"], {
+            "target-sha": "${{ steps.context.outputs.target-sha }}",
+            "action-target-branch": "${{ inputs.target-branch || steps.context.outputs.action-target-branch }}",
+        })
+        planner = next(
+            step for step in self.jobs["ParseChangelog"]["steps"]
+            if step.get("id") == "changelog"
+        )
+        self.assertEqual(self.step["env"], {
+            "EVENT_NAME": "${{ steps.context.outputs.event-name }}",
+            "VALIDATION_SHA": "${{ steps.context.outputs.target-sha }}",
+            "WORKFLOW_REF": "${{ steps.context.outputs.ref }}",
+            "BRANCH": "${{ steps.context.outputs.action-target-branch }}",
+            "TAG": "${{ steps.context.outputs.tag }}",
+            "IS_PR": "${{ steps.context.outputs.is-pr }}",
+            "PR_NUMBER": "${{ steps.context.outputs.pr-number }}",
+            "PR_SOURCE_BRANCH": "${{ steps.context.outputs.pr-head-ref }}",
+            "PR_SOURCE_SHA": "${{ steps.context.outputs.pr-head-sha }}",
+            "PR_TARGET_BRANCH": "${{ steps.context.outputs.pr-base-ref }}",
+            "RELEASE_SCOPE_BRANCH": planner["env"]["CHANGELOG_BRANCH"].replace(
+                "needs.CaptureContext.outputs.", "steps.context.outputs.",
+            ),
+        })
+
+    def test_prints_context_appropriate_branches_refs_and_shas(self):
+        pr = {
+            "EVENT_NAME": "pull_request", "WORKFLOW_REF": "refs/pull/12/merge",
+            "BRANCH": "dev/dummy", "IS_PR": "true", "PR_NUMBER": "12",
+            "PR_SOURCE_BRANCH": "dev/dummy", "PR_SOURCE_SHA": "b" * 40,
+            "PR_TARGET_BRANCH": "release/dummy", "RELEASE_SCOPE_BRANCH": "release/dummy",
+        }
+        pr_lines = [
+            "Workflow ref: refs/pull/12/merge", "PR number: 12",
+            "PR source branch: dev/dummy", f"PR source SHA: {'b' * 40}",
+            "PR target branch: release/dummy",
+        ]
+        cases = (
+            ("pull request", pr, [*pr_lines, "Release scope branch: release/dummy"]),
+            ("branch push", {
+                "EVENT_NAME": "push", "WORKFLOW_REF": "refs/heads/dev/dummy",
+                "BRANCH": "dev/dummy", "RELEASE_SCOPE_BRANCH": "dev/dummy",
+            }, [
+                "Workflow ref: refs/heads/dev/dummy", "Branch: dev/dummy",
+                "Release scope branch: dev/dummy",
+            ]),
+            ("manual branch run", {
+                "EVENT_NAME": "workflow_dispatch", "WORKFLOW_REF": "refs/heads/main",
+                "BRANCH": "main", "RELEASE_SCOPE_BRANCH": "main",
+            }, [
+                "Workflow ref: refs/heads/main", "Branch: main", "Release scope branch: main",
+            ]),
+            ("tag ref", {
+                "EVENT_NAME": "push", "WORKFLOW_REF": "refs/tags/dummy/v1.2.3",
+                "TAG": "dummy/v1.2.3",
+            }, [
+                "Workflow ref: refs/tags/dummy/v1.2.3", "Tag: dummy/v1.2.3",
+            ]),
+            ("explicit validation and scope overrides", {
+                **pr, "VALIDATION_SHA": "b" * 40, "RELEASE_SCOPE_BRANCH": "testing/dummy",
+            }, [*pr_lines, "Release scope branch: testing/dummy"]),
+            ("partial PR details", {
+                "EVENT_NAME": "issue_comment", "IS_PR": "true", "PR_NUMBER": "12",
+                "WORKFLOW_REF": "refs/heads/main",
+            }, [
+                "Workflow ref: refs/heads/main", "PR number: 12",
+                "PR source branch: unknown", "PR source SHA: unknown",
+                "PR target branch: unknown",
+            ]),
+            ("branch names are literal data", {
+                **pr, "PR_SOURCE_BRANCH": "dev/$(printf not-executed)",
+            }, [
+                "Workflow ref: refs/pull/12/merge", "PR number: 12",
+                "PR source branch: dev/$(printf not-executed)", f"PR source SHA: {'b' * 40}",
+                "PR target branch: release/dummy", "Release scope branch: release/dummy",
+            ]),
+        )
+        for name, overrides, expected in cases:
+            environment = {
+                **dict.fromkeys(self.step["env"], ""),
+                "IS_PR": "false", "VALIDATION_SHA": "a" * 40, **overrides,
+            }
+            with self.subTest(name=name):
+                result = self.run_step(self.step, environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [
+                    f"ℹ️ Event: {environment['EVENT_NAME']}",
+                    f"ℹ️ Validation SHA: {environment['VALIDATION_SHA']}",
+                    *(f"ℹ️ {line}" for line in expected),
+                ])
+                self.assertEqual(result.stderr, "")
+
+
+class CIMarkerWorkflowTests(CIWorkflowTestCase):
+    def run_marker(self, name, environment):
+        return self.run_step(self.jobs[name]["steps"][0], environment)
 
     def test_marker_jobs_have_stable_names_and_run_after_failed_dependencies(self):
         for name, needs in (

@@ -72,6 +72,9 @@
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps. Reusable CI accepts `target-sha` and
   `target-branch`; use the explicit SHA rather than a moving branch.
+- Context logs distinguish the validation SHA from the PR source SHA and label
+  PR source/head and target/base branches separately. Non-PR runs show the
+  workflow branch or tag; report the release-scoping branch separately.
 - PRs targeting `release/<action>` must originate from `<prefix>/<same-action>`,
   using any non-empty first path component as the prefix. Reject mismatched
   actions, unscoped sources such as `main`, and nested or malformed action suffixes.
