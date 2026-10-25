@@ -148,7 +148,7 @@
   Verify the merged PR's base branch and merge SHA; do not infer a merge from its
   commit message. Notes/cleanup pushes made with `GITHUB_TOKEN` do not trigger
   additional push workflows.
-- Trusted release verification rechecks the same source/target action pairing
+- Release verification rechecks the same source/target action pairing
   from the merged PR's API metadata before CI and publication. A mismatch is an
   explicit error before CI/publication, not an ignored direct push.
 - Capture context with `workflow-context`, pin the original merge SHA R, and run
@@ -178,11 +178,13 @@
   reopened CI runs in an approval-required state. A user with write access selects
   **Approve workflows to run**, waits for CI and reviews, then merges manually.
   Workflow approval only starts CI; it does not approve the code or merge the PR.
-- Release helpers and the context action run from the captured default-branch
-  automation checkout, not candidate code with a write token. Candidate code runs
-  only in read-only CI. The release calculator is SHA-pinned and runs in dry-run mode.
-  Keep release notes scoped to their action and explain migrations for breaking
-  changes.
+- Release helpers and the context action come from the incoming release commit R,
+  not a default-branch automation checkout. CaptureContext checks out the event
+  SHA; CI and Release reuse the captured merge SHA. Action tests run in read-only
+  CI; only Release runs the incoming helpers with write permissions after CI
+  succeeds. Review workflow/helper changes as privileged automation code. The
+  release calculator is SHA-pinned and runs in dry-run mode. Keep release notes
+  scoped to their action and explain migrations for breaking changes.
 - Never publish, push tags, or create GitHub releases without an explicit user
   request. Adding or updating release automation is not permission to run it.
 - Interrupted releases require **manual reconciliation**, not automatic resume.
@@ -200,7 +202,7 @@
   while allowing major/minor alias updates. Consider immutable GitHub releases;
   never attach GitHub releases to moving aliases or mark an action release as
   the repository-wide "latest" release.
-- Keep workflow permissions read-only by default. Only the trusted `Release` job
+- Keep workflow permissions read-only by default. Only the `Release` job
   grants `GITHUB_TOKEN` contents/pull-request write permissions, with actions read
   access retained for current-attempt CI verification. It supplies this token as
   `GH_TOKEN` for notes/publishing/cleanup/promotion; context capture and candidate
@@ -212,8 +214,9 @@
 
 ### Release automation setup
 
-- Merge this automation into the default branch before creating/updating release
-  branches; privileged jobs load their helpers from that trusted checkout.
+- Include the release workflow, helper scripts, and local `workflow-context`
+  action in release branches. Automation does not need to reach the default
+  branch before a release; protect release branches and review automation changes.
 - Use the built-in `GITHUB_TOKEN`; no App credentials or personal token are
   required. Under **Settings > Actions > General > Workflow permissions**, enable
   **Allow GitHub Actions to create and approve pull requests** so the workflow can
