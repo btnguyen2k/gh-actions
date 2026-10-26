@@ -299,7 +299,7 @@ def verify_ci(client: GitHub, plan: Plan) -> None:
 def promotions(client: GitHub, action: str, default_branch: str):
     owner = client.repository.split("/")[0]
     query = urlencode({
-        "state": "all", "head": f"{owner}:release/{action}", "base": default_branch,
+        "state": "open", "head": f"{owner}:release/{action}", "base": default_branch,
     })
     return client.pages(f"repos/{client.repository}/pulls?{query}")
 
@@ -310,18 +310,91 @@ def fetch(root: Path, commit: str) -> None:
     git(root, "fetch", "--quiet", "--no-tags", "origin", commit)
 
 
-def require_unstarted(root: Path, cycle: Cycle) -> None:
+def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    try:
+        git(root, "merge-base", "--is-ancestor", ancestor, descendant)
+        return True
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            return False
+        raise
+
+
+def require_unstarted(root: Path, cycle: Cycle) -> dict[str, str]:
     if remote_head(root, cycle.branch) != cycle.merge_sha:
         raise ValueError("Release branch already changed; reconcile the interrupted release manually.")
     tags = git(root, "ls-remote", "--tags", "origin", f"refs/tags/{cycle.action}/v*")
     objects = dict(line.split()[::-1] for line in tags.splitlines())
     prefix = f"refs/tags/{cycle.action}/v"
-    if any(
-        monorepo.VERSION.fullmatch(name[len(prefix):])
-        and objects.get(name + "^{}", target) == cycle.merge_sha
+    versions = {
+        name.removeprefix("refs/tags/"): objects.get(name + "^{}", target)
         for name, target in objects.items() if name.startswith(prefix)
-    ):
+        and monorepo.VERSION.fullmatch(name[len(prefix):])
+    }
+    if cycle.merge_sha in versions.values():
         raise ValueError("This merge already has a release tag; reconcile it manually.")
+    return versions
+
+
+def verify_previous_releases(root: Path, client: GitHub, cycle: Cycle, tags: dict[str, str]) -> None:
+    notes: dict[str, tuple[str, str]] = {}
+    cleanups: dict[str, tuple[str, str]] = {}
+    messages = git(
+        root, "log", "--full-history", "--format=%H%x00%B%x00", cycle.merge_sha, "--",
+        f"{cycle.action}/RELEASE-NOTES.md", ".semrelease/this_release",
+    ).split("\0")
+    for commit, message in zip(messages[::2], messages[1::2]):
+        for label, subject, records in (
+            ("Action-Release", "docs(action): record release notes", notes),
+            ("Action-Release-Cleanup", "chore(action): clear released changelog entries", cleanups),
+        ):
+            # Squash/merge summaries can copy earlier bookkeeping trailers.
+            if message.partition("\n")[0] != subject:
+                continue
+            matches = list(re.finditer(
+                rf"^{label}: (?P<action>{monorepo.ACTION_NAME.pattern})@"
+                rf"(?P<merge>{SHA.pattern})\nRelease: "
+                rf"(?P<tag>(?P=action)/v{monorepo.VERSION.pattern})$",
+                message, re.MULTILINE,
+            ))
+            if len(matches) != 1:
+                raise ValueError("Ambiguous release bookkeeping; reconcile previous releases manually.")
+            match = matches[0]
+            if match["action"] != cycle.action:
+                continue
+            if match["merge"] in records:
+                raise ValueError("Ambiguous release bookkeeping; reconcile previous releases manually.")
+            records[match["merge"]] = (commit.strip(), match["tag"])
+    if tags:
+        git(root, "fetch", "--quiet", "--tags", "--force", "origin")
+        published = git(root, "log", "--no-walk", "--format=%B%x00", *sorted(set(tags.values())))
+        if re.search(
+            rf"^Action-Release: {re.escape(cycle.action)}@{cycle.merge_sha}$", published, re.MULTILINE,
+        ):
+            raise ValueError("This merge already has a tagged release; reconcile it manually.")
+    for merge, (_, tag) in notes.items():
+        if merge not in cleanups or cleanups[merge][1] != tag:
+            raise ValueError(f"Previous release {tag} still needs matching cleanup; reconcile it manually.")
+    cleaned_tags = {tag for _, tag in cleanups.values()}
+    unmatched = {
+        tag: commit for tag, commit in tags.items()
+        if tag not in cleaned_tags and is_ancestor(root, commit, cycle.merge_sha)
+    }
+    if unmatched:
+        # PR history remains available even after a no-op notes release reaches main.
+        query = urlencode({"state": "closed", "base": cycle.branch})
+        prs = client.pages(f"repos/{client.repository}/pulls?{query}")
+        for tag, commit in unmatched.items():
+            previous = replace(cycle, merge_sha=commit)
+            if any(matching_merge(pr, previous) for pr in prs):
+                raise ValueError(f"Previous release {tag} still needs matching cleanup; reconcile it manually.")
+    for merge, (cleanup_sha, tag) in cleanups.items():
+        release_sha = notes[merge][0] if merge in notes else merge
+        if not is_ancestor(root, release_sha, cleanup_sha):
+            raise ValueError(
+                f"Previous release {tag} has unrelated cleanup; reconcile it manually."
+            )
+        require_published(root, client, tag, release_sha)
 
 
 def context(root: Path, client: GitHub, _path: Path) -> None:
@@ -360,29 +433,9 @@ def context(root: Path, client: GitHub, _path: Path) -> None:
     )
     cycle.validate()
     verify_source(client, cycle)
-    prs = promotions(client, action, default)
-    completed = {
-        match[1] for pr in prs if pr["merged_at"] is not None
-        for match in [re.search(
-            rf"<!-- action-release:{re.escape(action)}:([0-9a-f]{{40}}) -->", pr["body"] or "",
-        )] if match
-    }
-    if any(pr["state"] == "open" for pr in prs):
-        raise ValueError("The previous promotion PR must merge before another release cycle.")
-    if cycle.merge_sha in completed:
-        raise ValueError("This release cycle was already promoted; reconcile it manually.")
-    require_unstarted(root, cycle)
+    tags = require_unstarted(root, cycle)
     fetch(root, cycle.merge_sha)
-    messages = git(
-        root, "log", "--format=%B%x00", cycle.merge_sha, "--",
-        f"{cycle.action}/RELEASE-NOTES.md", ".semrelease/this_release",
-    )
-    for previous in re.findall(
-        rf"^Action-Release(?:-Cleanup)?: {re.escape(action)}@([0-9a-f]{{40}})$",
-        messages, re.MULTILINE,
-    ):
-        if previous != cycle.merge_sha and previous not in completed:
-            raise ValueError("An earlier notes preparation has not been promoted to main.")
+    verify_previous_releases(root, client, cycle, tags)
     emit(
         eligible=True, action=action, branch=cycle.branch, merge_sha=cycle.merge_sha,
         source_run_id=cycle.source_run_id, source_pr=cycle.source_pr,
@@ -572,33 +625,37 @@ def remote_head(root: Path, branch: str) -> str:
     return result[0]
 
 
-def release_record(client: GitHub, plan: Plan):
-    record = client.optional(f"repos/{plan.cycle.repository}/releases/tags/{quote(plan.tag, safe='')}")
+def release_record(client: GitHub, tag: str, notes: str | None = None):
+    record = client.optional(f"repos/{client.repository}/releases/tags/{quote(tag, safe='')}")
     if record is not None and (
-        record["tag_name"] != plan.tag or record["draft"] or record["prerelease"]
-        or (record["body"] or "").replace("\r\n", "\n").strip("\n")
-        != plan.release_notes.replace("\r\n", "\n").strip("\n")
+        record["tag_name"] != tag or record["draft"] or record["prerelease"]
+        or (
+            notes is not None and (record["body"] or "").replace("\r\n", "\n").strip("\n")
+            != notes.replace("\r\n", "\n").strip("\n")
+        )
     ):
-        raise ValueError("An existing GitHub Release conflicts with the frozen plan.")
+        raise ValueError("An existing GitHub Release conflicts with the expected stable release.")
     return record
 
 
 def require_new_release(root: Path, client: GitHub, plan: Plan) -> None:
     reference = f"refs/tags/{plan.tag}"
     if (
-        release_record(client, plan) is not None
+        release_record(client, plan.tag, plan.release_notes) is not None
         or git(root, "ls-remote", "--refs", "origin", reference)
     ):
         raise ValueError(f"{plan.tag} already exists; reconcile the release manually instead of retrying.")
 
 
-def require_published(root: Path, client: GitHub, plan: Plan) -> None:
-    if release_record(client, plan) is None:
-        raise ValueError("Publication must complete before cleanup or promotion.")
-    reference = f"refs/tags/{plan.tag}"
+def require_published(
+    root: Path, client: GitHub, tag: str, release_sha: str, notes: str | None = None,
+) -> None:
+    if release_record(client, tag, notes) is None:
+        raise ValueError(f"Publication of {tag} must complete before cleanup, promotion, or another cycle.")
+    reference = f"refs/tags/{tag}"
     refs = git(root, "ls-remote", "--tags", "origin", reference, reference + "^{}")
     objects = dict(line.split()[::-1] for line in refs.splitlines())
-    if objects.get(reference + "^{}", objects.get(reference)) != plan.release_sha:
+    if objects.get(reference + "^{}", objects.get(reference)) != release_sha:
         raise ValueError("The published immutable tag does not match release N.")
 
 
@@ -660,7 +717,7 @@ def publish(root: Path, client: GitHub, path: Path) -> None:
 
 def cleanup(root: Path, client: GitHub, path: Path) -> None:
     plan = frozen(path)
-    require_published(root, client, plan)
+    require_published(root, client, plan.tag, plan.release_sha, plan.release_notes)
     head = remote_head(root, plan.cycle.branch)
     if head != plan.release_sha:
         raise ValueError("Release branch changed; reconcile cleanup manually.")
@@ -669,32 +726,46 @@ def cleanup(root: Path, client: GitHub, path: Path) -> None:
 
 def promote(root: Path, client: GitHub, path: Path) -> None:
     plan = frozen(path)
-    require_published(root, client, plan)
+    require_published(root, client, plan.tag, plan.release_sha, plan.release_notes)
     next_steps = (
         "If prompted, select 'Approve workflows to run' on the promotion PR to start CI. "
         "Merge manually after the required checks and reviews pass."
     )
     if remote_head(root, plan.cycle.branch) != plan.cleanup_sha:
         raise ValueError("Promotion requires the recorded cleanup commit.")
-    if any(
-        item["state"] == "open" or plan.cycle.marker in (item["body"] or "")
-        for item in promotions(client, plan.cycle.action, plan.cycle.default_branch)
-    ):
-        raise ValueError("A promotion PR already exists; reconcile it manually.")
-    pr = client.api(f"repos/{plan.cycle.repository}/pulls", "POST", {
-        "title": f"Promote {plan.tag} to {plan.cycle.default_branch}",
-        "head": plan.cycle.branch, "base": plan.cycle.default_branch,
-        "body": (
-            f"{plan.cycle.marker}\n\nPromotes `{plan.tag}` and its release bookkeeping.\n\n"
+    prs = promotions(client, plan.cycle.action, plan.cycle.default_branch)
+    if len(prs) > 1:
+        raise ValueError("Multiple open promotion PRs match this action; reconcile them manually.")
+    pr = prs[0] if prs else None
+    if pr is not None and pr["head"]["sha"] != plan.cleanup_sha:
+        raise ValueError("The open promotion PR does not point to the recorded cleanup commit.")
+    title = f"Promote {plan.cycle.action} to {plan.cycle.default_branch}"
+    body = (pr["body"] or "") if pr is not None else (
+        f"Promotes all unmerged changes from `{plan.cycle.branch}` "
+        f"to `{plan.cycle.default_branch}`, including the releases below."
+    )
+    if plan.cycle.marker not in body:
+        body = body + ("\n\n" if body else "") + (
+            f"{plan.cycle.marker}\n\n## Release `{plan.tag}`\n\n"
             f"- Source PR: #{plan.cycle.source_pr}\n"
             f"- CI-tested merge: `{plan.cycle.merge_sha}`\n"
             f"- Release commit: `{plan.release_sha}`\n"
             f"- Changelog cleanup: `{plan.cleanup_sha}`\n\n"
             f"{next_steps}\n"
-        ),
-    })
-    if pr["head"]["sha"] != plan.cleanup_sha:
-        raise ValueError("Promotion branch moved while the PR was being created.")
+        )
+    if pr is None:
+        pr = client.api(f"repos/{plan.cycle.repository}/pulls", "POST", {
+            "title": title, "head": plan.cycle.branch, "base": plan.cycle.default_branch, "body": body,
+        })
+    elif pr["title"] != title or (pr["body"] or "") != body:
+        pr = client.api(f"repos/{plan.cycle.repository}/pulls/{pr['number']}", "PATCH", {
+            "title": title, "body": body,
+        })
+    if (
+        pr["head"]["sha"] != plan.cleanup_sha or pr["state"] != "open"
+        or pr["merged_at"] is not None
+    ):
+        raise ValueError("Promotion PR changed during the handoff; reconcile it manually.")
     print(f"ℹ️ Promotion PR: {pr['html_url']}")
     print(f"ℹ️ {next_steps}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):

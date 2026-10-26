@@ -52,16 +52,38 @@ jobs:
         with:
           target-sha: ${{ inputs.target-sha }}
       - name: Print workflow context
+        shell: bash
         env:
           EVENT_NAME: ${{ steps.context.outputs.event-name }}
-          TARGET_SHA: ${{ steps.context.outputs.target-sha }}
-          TARGET_BRANCH: ${{ inputs.target-branch || steps.context.outputs.action-target-branch }}
+          VALIDATION_SHA: ${{ steps.context.outputs.target-sha }}
+          WORKFLOW_REF: ${{ steps.context.outputs.ref }}
+          BRANCH: ${{ steps.context.outputs.action-target-branch }}
+          TAG: ${{ steps.context.outputs.tag }}
+          IS_PR: ${{ steps.context.outputs.is-pr }}
           PR_NUMBER: ${{ steps.context.outputs.pr-number }}
+          PR_SOURCE_BRANCH: ${{ steps.context.outputs.pr-head-ref }}
+          PR_SOURCE_SHA: ${{ steps.context.outputs.pr-head-sha }}
+          PR_TARGET_BRANCH: ${{ steps.context.outputs.pr-base-ref }}
+          RELEASE_SCOPE_BRANCH: ${{ inputs.target-branch || github.base_ref || steps.context.outputs.action-target-branch }}
         run: |
           printf 'ℹ️ Event: %s\n' "$EVENT_NAME"
-          printf 'ℹ️ Target SHA: %s\n' "$TARGET_SHA"
-          printf 'ℹ️ Target branch: %s\n' "$TARGET_BRANCH"
-          printf 'ℹ️ PR number: %s\n' "$PR_NUMBER"
+          printf 'ℹ️ Validation SHA: %s\n' "$VALIDATION_SHA"
+          if [ -n "$WORKFLOW_REF" ]; then
+            printf 'ℹ️ Workflow ref: %s\n' "$WORKFLOW_REF"
+          fi
+          if [ "$IS_PR" = "true" ]; then
+            printf 'ℹ️ PR number: %s\n' "${PR_NUMBER:-unknown}"
+            printf 'ℹ️ PR source branch: %s\n' "${PR_SOURCE_BRANCH:-unknown}"
+            printf 'ℹ️ PR source SHA: %s\n' "${PR_SOURCE_SHA:-unknown}"
+            printf 'ℹ️ PR target branch: %s\n' "${PR_TARGET_BRANCH:-unknown}"
+          elif [ -n "$TAG" ]; then
+            printf 'ℹ️ Tag: %s\n' "$TAG"
+          elif [ -n "$BRANCH" ]; then
+            printf 'ℹ️ Branch: %s\n' "$BRANCH"
+          fi
+          if [ -n "$RELEASE_SCOPE_BRANCH" ]; then
+            printf 'ℹ️ Release scope branch: %s\n' "$RELEASE_SCOPE_BRANCH"
+          fi
 
   ParseChangelog:
     name: Parse release changelog
