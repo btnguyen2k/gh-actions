@@ -37,9 +37,17 @@
   secrets; use least-privilege tokens and explicit, actionable failures.
 - Write outputs through GitHub's supported output mechanism, such as
   `$GITHUB_OUTPUT`, and preserve the documented output format.
-- Prefix human-readable workflow/script messages with ℹ️ for information, ✅ for
-  success, ⚠️ for warnings, and ❌ for errors. Keep annotation commands, required
-  check names, machine-readable outputs, and release-note content unchanged.
+- Keep reusable-action logs minimal and preferably plain text; avoid emojis
+  whenever possible. Prefer documented, machine-readable outputs such as
+  `status` or `result` for expected, non-fatal outcomes so caller workflows decide
+  how to react and present messages.
+- Fatal errors must fail the action explicitly, for example by throwing an
+  exception or exiting nonzero. Do not merely log an error or turn a fatal
+  failure into a successful status-only response.
+- Prefix human-readable messages in workflows and repository automation scripts
+  with ℹ️ for information, ✅ for success, ⚠️ for warnings, and ❌ for errors.
+  Keep annotation commands, required check names, machine-readable outputs, and
+  release-note content unchanged.
   Python CLIs configure UTF-8 output, and Python workflows set
   `PYTHONIOENCODING: "utf-8"`; decode captured log output as UTF-8 on Windows too.
 
