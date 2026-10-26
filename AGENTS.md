@@ -124,6 +124,16 @@
   This command prepares release inputs; version calculation and final release
   notes are delegated to action-semrelease in CI, not implemented in Python.
 
+## Pre-release action review
+
+- Use `.github\agents\action-release-reviewer.agent.md` for a review-only check of
+  repository conventions and the selected action's own documented contract.
+- Select `/agent action-release-reviewer`, then request
+  `Review <action-name> before release.` Include a candidate ref or comparison
+  baseline when reviewing something other than the current checkout.
+- The reviewer reports evidence-backed readiness, blockers, and incomplete
+  checks. It does not fix findings, change release artifacts, or publish.
+
 ## Commit messages
 
 - For action changes, use `type(action): <description>` for every release,
