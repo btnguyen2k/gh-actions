@@ -35,6 +35,10 @@
 - Avoid runtime dependencies on sibling action directories. If shared source is
   introduced, bundle it into each consumer where appropriate and test/release
   every affected action independently.
+- Repository workflows invoke in-repository actions via `uses: ./<action>`,
+  not published self-references. Check out the intended source commit first.
+  Privileged `workflow_run` jobs use their trusted workflow SHA, never the
+  upstream PR head.
 - Include composite action directories in the `github-actions` update entry in
   `.github/dependabot.yml` when they reference external actions. The root `/`
   scan does not cover nested action metadata.
@@ -267,8 +271,7 @@
   Never bypass branch rules or auto-merge release-promotion PRs.
 - The reusable `automerge-dependabot` action independently enforces these event
   and merge guards, returning `status`, `reason`, and `pr-number` for caller-owned
-  presentation. Keep it checkout-free and self-contained. Adopt it in the
-  repository workflow only after release, using a published commit SHA.
+  presentation. Keep the action itself checkout-free and self-contained.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 

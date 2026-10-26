@@ -965,73 +965,16 @@ class DependabotAutomergeWorkflowTests(unittest.TestCase):
             .read_text(encoding="utf-8")
         )
         self.job = self.workflow["jobs"]["automerge"]
-        self.step = self.job["steps"][0]
-        self.head = "a" * 40
-        self.request = {"owner": "example", "repo": "actions", "pull_number": 17}
-        self.pr = {
-            "user": {"login": "dependabot[bot]"},
-            "base": {"ref": "main"},
-            "state": "open",
-            "draft": False,
-            "head": {"sha": self.head},
-        }
-        self.context = {
-            "repo": {"owner": "example", "repo": "actions"},
-            "payload": {
-                "repository": {"default_branch": "main"},
-                "workflow_run": {
-                    "event": "pull_request",
-                    "conclusion": "success",
-                    "actor": {"login": "human-rerunning-ci"},
-                    "head_sha": self.head,
-                    "pull_requests": [{"number": 17, "head": {"sha": self.head}}],
-                },
-            },
-        }
-
-    def run_script(self, *, pr=None, merge=None, error=None):
-        fixture = {
-            "script": self.step["with"]["script"],
-            "context": self.context,
-            "pr": self.pr if pr is None else pr,
-            "merge": {"merged": True} if merge is None else merge,
-            "error": error,
-        }
-        runner = """
-            import fs from "node:fs";
-            const fixture = JSON.parse(fs.readFileSync(0, "utf8"));
-            const calls = [];
-            const messages = [];
-            const respond = (method, data) => async (request) => {
-                calls.push({method, ...request});
-                if (fixture.error?.method === method) {
-                    throw new Error(fixture.error.message);
-                }
-                return {data};
-            };
-            const github = {rest: {pulls: {
-                get: respond("get", fixture.pr),
-                merge: respond("merge", fixture.merge),
-            }}};
-            const logger = {log: (message) => messages.push(message)};
-            const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-            let error = null;
-            try {
-                await new AsyncFunction("github", "context", "console", fixture.script)(
-                    github, fixture.context, logger,
-                );
-            } catch (failure) {
-                error = failure.message;
-            }
-            process.stdout.write(JSON.stringify({calls, messages, error}));
-        """
-        result = subprocess.run(
-            ["node", "--input-type=module", "-e", runner],
-            input=json.dumps(fixture), capture_output=True, encoding="utf-8",
-            check=False, timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return json.loads(result.stdout)
+        self.checkout = self.job["steps"][0]
+        self.step = self.job["steps"][1]
+        self.report = self.job["steps"][2]
+        self.bash = "bash"
+        if sys.platform == "win32":
+            native = Path(monorepo.capture(
+                monorepo.ROOT, "git", "var", "GIT_SHELL_PATH",
+            )).with_name("bash.exe")
+            self.assertTrue(native.is_absolute() and native.is_file())
+            self.bash = str(native)
 
     def test_keeps_one_job_gated_on_successful_pr_ci(self):
         self.assertEqual(self.workflow["on"], {
@@ -1046,102 +989,60 @@ class DependabotAutomergeWorkflowTests(unittest.TestCase):
         self.assertNotIn("concurrency", self.job)
         self.assertNotIn("continue-on-error", self.job)
 
-    def test_skips_missing_pr_associations_before_any_api_call(self):
-        for associations in ([], None, [{}]):
-            with self.subTest(associations=associations):
-                self.context["payload"]["workflow_run"]["pull_requests"] = associations
-                result = self.run_script()
-                self.assertIsNone(result["error"])
-                self.assertEqual(result["calls"], [])
-                self.assertEqual(result["messages"], ["ℹ️ Skipped: no associated PR."])
-
-    def test_scopes_write_permissions_and_pins_the_only_step(self):
+    def test_checks_out_trusted_workflow_sha_before_using_local_action(self):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         self.assertEqual(self.job["permissions"], {
             "contents": "write", "pull-requests": "write",
         })
-        self.assertEqual(len(self.job["steps"]), 1)
+        self.assertEqual(len(self.job["steps"]), 3)
         self.assertRegex(
-            self.step["uses"], r"^actions/github-script@[0-9a-f]{40}$",
+            self.checkout["uses"], r"^actions/checkout@[0-9a-f]{40}$",
         )
-        self.assertEqual(self.step["with"]["github-token"], "${{ secrets.GITHUB_TOKEN }}")
+        self.assertEqual(self.checkout["with"], {
+            "ref": "${{ github.sha }}", "persist-credentials": False,
+        })
+        self.assertNotIn("continue-on-error", self.checkout)
+        self.assertEqual(self.step["id"], "merge")
+        self.assertEqual(self.step["uses"], "./automerge-dependabot")
+        self.assertEqual(self.step["with"], {
+            "github-token": "${{ secrets.GITHUB_TOKEN }}",
+        })
         self.assertNotIn("continue-on-error", self.step)
 
-    def test_merges_the_ci_head_even_when_a_human_reruns_ci(self):
-        result = self.run_script()
-        self.assertIsNone(result["error"])
-        self.assertEqual(result["calls"], [
-            {"method": "get", **self.request},
-            {"method": "merge", **self.request, "sha": self.head},
-        ])
-        self.assertEqual(result["messages"], ["✅ Merged PR #17."])
-
-    def test_skips_ineligible_prs_without_merging(self):
-        for changes in (
-            {"user": {"login": "octocat"}},
-            {"user": {"login": "github-actions[bot]"}},
-            {"user": None},
-            {"base": {"ref": "release/dummy"}},
-            {"state": "closed"},
-            {"state": "closed", "merged": True},
-            {"draft": True},
-        ):
-            with self.subTest(changes=changes):
-                result = self.run_script(pr={**self.pr, **changes})
-                self.assertIsNone(result["error"])
-                self.assertEqual(result["calls"], [{"method": "get", **self.request}])
-                self.assertEqual(result["messages"], [
-                    "ℹ️ Skipped PR #17: not an open, non-draft Dependabot PR "
-                    "into the default branch.",
-                ])
-
-    def test_uses_the_repository_default_branch_instead_of_hardcoded_main(self):
-        self.context["payload"]["repository"]["default_branch"] = "trunk"
-        result = self.run_script()
-        self.assertEqual(result["calls"], [{"method": "get", **self.request}])
-        self.pr["base"]["ref"] = "trunk"
-        result = self.run_script()
-        self.assertIsNone(result["error"])
-        self.assertEqual(result["calls"][-1], {
-            "method": "merge", **self.request, "sha": self.head,
+    def test_reports_action_outputs_without_interpolating_shell_code(self):
+        self.assertEqual(self.report["shell"], "bash")
+        self.assertEqual(self.report["env"], {
+            "MERGE_STATUS": "${{ steps.merge.outputs.status }}",
+            "MERGE_REASON": "${{ steps.merge.outputs.reason }}",
+            "PR_NUMBER": "${{ steps.merge.outputs.pr-number }}",
         })
+        self.assertNotIn("${{", self.report["run"])
+        self.assertNotIn("if", self.report)
+        self.assertNotIn("continue-on-error", self.report)
 
-    def test_skips_stale_ci_even_if_associated_pr_metadata_has_advanced(self):
-        latest = "b" * 40
-        self.context["payload"]["workflow_run"]["pull_requests"][0]["head"]["sha"] = latest
-        self.pr["head"]["sha"] = latest
-        result = self.run_script()
-        self.assertIsNone(result["error"])
-        self.assertEqual(result["calls"], [{"method": "get", **self.request}])
-        self.assertEqual(result["messages"], [
-            f"ℹ️ Skipped PR #17: head {latest} does not match successful CI {self.head}.",
-        ])
-
-    def test_unsuccessful_merge_response_is_an_error_not_a_success_message(self):
-        result = self.run_script(merge={
-            "merged": False, "message": "Required status checks have not passed",
-        })
-        self.assertEqual(
-            result["error"],
-            "❌ PR #17 was not merged: Required status checks have not passed",
+    def test_reports_merges_and_skips(self):
+        cases = (
+            ("merged", "", "17", "✅ Merged PR #17."),
+            ("skipped", "ineligible-pr", "17", "ℹ️ Skipped PR #17: ineligible-pr."),
+            ("skipped", "head-sha-mismatch", "17", "ℹ️ Skipped PR #17: head-sha-mismatch."),
+            ("skipped", "no-associated-pr", "", "ℹ️ Skipped: no-associated-pr."),
         )
-        self.assertEqual(result["messages"], [])
-
-    def test_api_errors_including_concurrent_updates_are_not_hidden_or_retried(self):
-        for method, message in (
-            ("get", "403 Forbidden"),
-            ("merge", "405 Required status checks have not passed"),
-            ("merge", "409 Head branch was modified"),
-            ("merge", "500 Internal Server Error"),
-        ):
-            with self.subTest(method=method, message=message):
-                result = self.run_script(error={"method": method, "message": message})
-                self.assertEqual(result["error"], message)
-                self.assertEqual(result["messages"], [])
-                self.assertEqual(
-                    [call["method"] for call in result["calls"]],
-                    ["get"] if method == "get" else ["get", "merge"],
+        for status, reason, pr_number, message in cases:
+            with self.subTest(status=status, reason=reason):
+                result = subprocess.run(
+                    [
+                        self.bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
+                        self.report["run"],
+                    ],
+                    cwd=monorepo.ROOT,
+                    env={
+                        **os.environ, "MERGE_STATUS": status, "MERGE_REASON": reason,
+                        "PR_NUMBER": pr_number,
+                    },
+                    capture_output=True, encoding="utf-8", check=False, timeout=10,
                 )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), message)
 
 
 class DependabotAutomergeActionTests(unittest.TestCase):
