@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["**", "!release/**"]
+    branches: ["**", "!release/**", "!dependabot/**"]
   pull_request:
     types: [opened, synchronize, reopened, edited]
   workflow_dispatch:

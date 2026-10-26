@@ -1306,6 +1306,17 @@ class ReleasePreviewWorkflowTests(unittest.TestCase):
         self.plan = self.workflow["jobs"]["ParseChangelog"]
         self.preview = self.workflow["jobs"]["PreviewRelease"]
 
+    def test_dependabot_uses_pr_ci_without_duplicate_push_checks(self):
+        self.assertEqual(self.workflow["on"]["push"], {
+            "branches": ["**", "!release/**", "!dependabot/**"],
+        })
+        self.assertEqual(self.workflow["on"]["pull_request"], {
+            "types": ["opened", "synchronize", "reopened", "edited"],
+        })
+        self.assertEqual(set(self.workflow["on"]), {
+            "push", "pull_request", "workflow_dispatch", "workflow_call",
+        })
+
     def test_pr_retargeting_reruns_ci_and_pairing_is_checked_before_changelog_planning(self):
         self.assertEqual(
             self.workflow["on"]["pull_request"]["types"],

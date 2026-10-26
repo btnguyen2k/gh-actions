@@ -116,9 +116,12 @@
   changelog planning and successful previews, or an intentional preview skip
   (no selected releases, explicit preview disable, or a deleted branch).
   Failures, cancellations, and unexpected skips fail the corresponding marker.
-- Standalone push CI excludes `release/**`; the release workflow owns those
-  pushes. Ordinary branch pushes, pull requests (including those into release
-  branches), and manual CI keep their existing coverage and previews.
+- Standalone push CI excludes `release/**`, owned by the release workflow, and
+  `dependabot/**`, covered by pull-request CI. Avoid duplicate push/PR runs with
+  the same required check names on Dependabot heads: automerge attempts merging
+  after successful PR CI without waiting or retrying. Other branch pushes,
+  pull requests (including those into release branches), and manual/reusable CI
+  keep their existing coverage and previews.
 - Run the same report locally with `python .github\scripts\monorepo.py changelog`;
   set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
   This command prepares release inputs; version calculation and final release
@@ -244,8 +247,9 @@
   promotion descriptions are optional and never determine release eligibility.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
-  never attach GitHub releases to moving aliases or mark an action release as
-  the repository-wide "latest" release.
+  never attach GitHub releases to moving aliases. Publish internal `dummy`
+  releases with `make_latest: "false"` and all other action releases with
+  `make_latest: "true"`. The Latest designation is repository-wide, not per action.
 - Keep workflow permissions read-only by default. Only `Release` and the
   Dependabot auto-merge job grant `GITHUB_TOKEN` contents/pull-request write.
   `Release` additionally retains actions read access for current-attempt CI
