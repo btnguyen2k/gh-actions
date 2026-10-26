@@ -6,6 +6,15 @@ on Node.js 24 with no external dependencies or build step.
 
 ## Usage
 
+You can use a published version tag or the full commit SHA of that action's
+release. Version-tag references include the action name, for example
+`btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0`
+(replace `v0.1.0` with your chosen published version).
+
+For reproducibility and stronger supply-chain security, prefer the full released
+commit SHA. Replace `<released-commit-sha>` in the examples below with that SHA,
+or use the selected action-prefixed version tag instead.
+
 Minimal job configuration; no GitHub API permission is needed:
 
 ```yaml
