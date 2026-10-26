@@ -7,3 +7,5 @@
 # Follow each header line with the list of changes for that release.
 # touch = 1
 
+#!automerge-dependabot/v0.1.0
+- feat(action): merge eligible Dependabot pull requests after successful CI

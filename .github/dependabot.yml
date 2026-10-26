@@ -1,7 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /automerge-dependabot
     schedule:
       interval: weekly
       day: saturday

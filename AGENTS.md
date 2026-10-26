@@ -35,6 +35,9 @@
 - Avoid runtime dependencies on sibling action directories. If shared source is
   introduced, bundle it into each consumer where appropriate and test/release
   every affected action independently.
+- Include composite action directories in the `github-actions` update entry in
+  `.github/dependabot.yml` when they reference external actions. The root `/`
+  scan does not cover nested action metadata.
 - Never interpolate untrusted contexts or inputs directly into shell code. Pass
   values through environment variables or arguments and quote them. Do not log
   secrets; use least-privilege tokens and explicit, actionable failures.
@@ -120,6 +123,16 @@
   set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
   This command prepares release inputs; version calculation and final release
   notes are delegated to action-semrelease in CI, not implemented in Python.
+
+## Pre-release action review
+
+- Use `.github\agents\action-release-reviewer.agent.md` for a review-only check of
+  repository conventions and the selected action's own documented contract.
+- Select `/agent action-release-reviewer`, then request
+  `Review <action-name> before release.` Include a candidate ref or comparison
+  baseline when reviewing something other than the current checkout.
+- The reviewer reports evidence-backed readiness, blockers, and incomplete
+  checks. It does not fix findings, change release artifacts, or publish.
 
 ## Commit messages
 
@@ -248,6 +261,10 @@
   metadata, compare its head with `workflow_run.head_sha`, and pass the same SHA
   to the merge API. Skip stale/ineligible PRs and surface API/merge failures.
   Never bypass branch rules or auto-merge release-promotion PRs.
+- The reusable `automerge-dependabot` action independently enforces these event
+  and merge guards, returning `status`, `reason`, and `pr-number` for caller-owned
+  presentation. Keep it checkout-free and self-contained. Adopt it in the
+  repository workflow only after release, using a published commit SHA.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 

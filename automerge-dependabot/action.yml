@@ -1,0 +1,40 @@
+name: Automerge Dependabot
+description: Merge an eligible Dependabot PR after successful CI for its current head.
+
+inputs:
+  github-token:
+    description: Token with contents and pull-requests write access to the workflow repository.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  status:
+    description: Whether the PR was merged or skipped.
+    value: ${{ steps.merge.outputs.status }}
+  reason:
+    description: Machine-readable skip reason; empty after a successful merge.
+    value: ${{ steps.merge.outputs.reason }}
+  pr-number:
+    description: Associated PR number; empty when skipped before selecting a PR.
+    value: ${{ steps.merge.outputs.pr-number }}
+
+runs:
+  using: composite
+  steps:
+    - name: Merge PR
+      id: merge
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ACTION_TOKEN: ${{ inputs.github-token }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          if (!process.env.ACTION_TOKEN?.trim()) {
+            throw new Error('github-token must be a nonempty token.');
+          }
+          const merge = require(require('node:path').join(process.env.ACTION_PATH, 'merge.cjs'));
+          const result = await merge({ github, context });
+          for (const [name, value] of Object.entries(result)) {
+            core.setOutput(name, value);
+          }
