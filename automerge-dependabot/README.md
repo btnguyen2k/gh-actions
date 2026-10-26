@@ -62,6 +62,28 @@ example's job condition skips them.
 The action independently rechecks the event and successful completion; the job
 condition is an optimization, not its only safety guard.
 
+### CI coordination
+
+A successful upstream run does not mean every required check or review has
+finished. The action makes one immediate merge attempt, and GitHub still enforces
+all repository rules. A blocked merge fails the action without polling or retries.
+
+Avoid duplicate `push` and `pull_request` CI runs publishing the same required
+check names for a Dependabot head. Keep PR CI and exclude Dependabot branches
+from push CI. For example, the upstream CI workflow can use:
+
+```yaml
+on:
+  push:
+    branches: ["**", "!dependabot/**"]
+  pull_request:
+```
+
+Keep any existing branch exclusions, PR event types, and other triggers. This
+avoids the duplicate-run race; other required checks and reviews must still be
+satisfied when the merge is attempted. The recommended post-CI workflow ignores
+`push` completions, so they cannot provide a later merge attempt.
+
 ## Inputs
 
 | Input | Default | Meaning |
