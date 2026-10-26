@@ -1,22 +1,31 @@
 # automerge-dependabot
 
 Merge an open, non-draft Dependabot PR into the workflow repository's default
-branch after successful CI for its current head. No checkout is required, and
-the action never executes PR code or downloads artifacts from the upstream run.
-
-This composite action reuses SHA-pinned `actions/github-script` v9 (Node.js 24).
-It requires a Node.js 24-capable GitHub Actions runner and supports Ubuntu,
-Windows, and macOS through the repository's existing CI matrix. No package
-installation or build step is required.
+branch after successful CI for its current head. No checkout, package installation,
+or build step is required. The action never executes PR code or downloads
+artifacts from the upstream run.
 
 ## Usage
 
-The caller owns the workflow trigger, CI workflow name, runner, permissions, and
-human-facing messages. Replace `<released-commit-sha>` with the reviewed commit
-of a published `automerge-dependabot/vX.Y.Z` release; the placeholder does not
-identify an existing release.
+Your repository should have a CI workflow that runs for pull requests. Add a
+post-CI workflow like the example below to merge eligible Dependabot PRs after
+that CI succeeds.
+
+The caller chooses the runner and controls the trigger, permissions, and
+human-facing messages.
+
+You can use a published version tag or the full commit SHA of that action's
+release. Version-tag references include the action name, for example
+`btnguyen2k/gh-actions/automerge-dependabot@automerge-dependabot/v0.1.0`
+(replace `v0.1.0` with your chosen published version).
+
+For reproducibility and stronger supply-chain security, prefer the full released
+commit SHA. Replace `<released-commit-sha>` below with that SHA, or use the
+selected action-prefixed version tag instead.
 
 ```yaml
+# Automatically merge PRs from dependabot
+
 name: Automerge Dependabot
 
 on:
