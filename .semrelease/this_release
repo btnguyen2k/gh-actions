@@ -13,5 +13,3 @@
 - feat(action): support target SHA overrides
 - feat(action): expose typed JSON context alongside individual outputs
 
-#!dummy
-- feat(action): print touch value with the testing-only message
