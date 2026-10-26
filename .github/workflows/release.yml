@@ -135,5 +135,5 @@ jobs:
         run: python .github/scripts/release_workflow.py publish
       - name: Clean only the published changelog section
         run: python .github/scripts/release_workflow.py cleanup
-      - name: Create the promotion PR for manual merge
+      - name: Create or update the promotion PR for manual merge
         run: python .github/scripts/release_workflow.py promote

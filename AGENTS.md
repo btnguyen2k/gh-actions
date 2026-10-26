@@ -37,9 +37,17 @@
   secrets; use least-privilege tokens and explicit, actionable failures.
 - Write outputs through GitHub's supported output mechanism, such as
   `$GITHUB_OUTPUT`, and preserve the documented output format.
-- Prefix human-readable workflow/script messages with ℹ️ for information, ✅ for
-  success, ⚠️ for warnings, and ❌ for errors. Keep annotation commands, required
-  check names, machine-readable outputs, and release-note content unchanged.
+- Keep reusable-action logs minimal and preferably plain text; avoid emojis
+  whenever possible. Prefer documented, machine-readable outputs such as
+  `status` or `result` for expected, non-fatal outcomes so caller workflows decide
+  how to react and present messages.
+- Fatal errors must fail the action explicitly, for example by throwing an
+  exception or exiting nonzero. Do not merely log an error or turn a fatal
+  failure into a successful status-only response.
+- Prefix human-readable messages in workflows and repository automation scripts
+  with ℹ️ for information, ✅ for success, ⚠️ for warnings, and ❌ for errors.
+  Keep annotation commands, required check names, machine-readable outputs, and
+  release-note content unchanged.
   Python CLIs configure UTF-8 output, and Python workflows set
   `PYTHONIOENCODING: "utf-8"`; decode captured log output as UTF-8 on Windows too.
 
@@ -53,6 +61,7 @@
   and the files being checked.
 - Test repository tooling with
   `python -m unittest discover --start-directory .github\scripts --pattern "test_*.py"`.
+  Workflow script tests also require Node.js.
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
   `tests/run.sh` runs from its own action directory through Bash, owns its
   dependency setup, and must return a nonzero exit code on failure. CI currently
@@ -72,6 +81,9 @@
 - CI first runs the local `workflow-context` action and passes its `target-sha`
   output to downstream checkout steps. Reusable CI accepts `target-sha` and
   `target-branch`; use the explicit SHA rather than a moving branch.
+- Context logs distinguish the validation SHA from the PR source SHA and label
+  PR source/head and target/base branches separately. Non-PR runs show the
+  workflow branch or tag; report the release-scoping branch separately.
 - PRs targeting `release/<action>` must originate from `<prefix>/<same-action>`,
   using any non-empty first path component as the prefix. Reject mismatched
   actions, unscoped sources such as `main`, and nested or malformed action suffixes.
@@ -169,11 +181,24 @@
   cleanup C onto the same release branch. Preserve other sections and the committed
   release-notes history. Push notes and cleanup with expected-head leases; stop
   on unexpected branch movement rather than overwriting it.
-- Create the promotion PR into the default branch for **manual merge** after
-  required checks and reviews. Never request auto-merge or push directly to the
-  default branch. Only one active cycle per action is allowed until promotion is
-  merged; release branches should start their next cycle from the latest default
-  branch.
+- Promotion into the default branch is independent of publication. Another
+  `dev/<action>` (or other valid source) PR may merge into `release/<action>`
+  while promotion is pending, provided earlier publication and cleanup completed.
+  Verify prior notes/cleanup bookkeeping against the immutable full-version tag
+  and published stable GitHub Release, not promotion PR bodies or main ancestry.
+  When notes are unchanged, use the tag's verified release-PR merge to detect
+  missing cleanup even though there is no generated notes commit.
+  Incomplete or conflicting publication/cleanup still requires manual reconciliation.
+- Keep one open promotion PR per action into the default branch. Create it when
+  none is open; otherwise reuse it, update its title, and append the new release's
+  information without replacing existing description text. The PR's source branch
+  and cumulative diff advance with each release. Closed or merged PRs do not
+  block a new one; ambiguous multiple open matches fail explicitly.
+- Promotion remains a **manual merge** after the latest release finishes and
+  required checks/reviews pass. Never request auto-merge or push directly to the
+  default branch. Publications remain serialized per action. Base subsequent
+  development on the latest release branch, including its release notes and
+  cleanup, so previously released staging entries are not restored.
 - Promotion PRs created/updated with `GITHUB_TOKEN` start their opened/synchronize/
   reopened CI runs in an approval-required state. A user with write access selects
   **Approve workflows to run**, waits for CI and reviews, then merges manually.
@@ -187,28 +212,38 @@
   scoped to their action and explain migrations for breaking changes.
 - Never publish, push tags, or create GitHub releases without an explicit user
   request. Adding or updating release automation is not permission to run it.
-- Interrupted releases require **manual reconciliation**, not automatic resume.
+- Interrupted publication/cleanup requires **manual reconciliation**, not automatic resume.
   There is no recovery dispatch, artifact checkpoint, or historical CI reuse.
   Retry with **Re-run all jobs** only if no release writes occurred; every attempt
   needs its own successful pinned-SHA CI. Failed-jobs-only reruns cannot borrow
   native CI successes from an earlier attempt.
-- If notes/cleanup commits, tags, a GitHub release, or a promotion PR already
-  exist, inspect and finish the interrupted release manually. Do not recalculate
-  another version, overwrite full-version tags, or replay completed writes.
-  If creating the promotion PR manually, include
-  `<!-- action-release:<action>:<original-merge-sha> -->` in its body so the next
-  cycle can verify that the previous bookkeeping was promoted.
+- Do not replay an interrupted cycle, recalculate another version after partial
+  writes, or overwrite full-version tags. Manual cleanup must retain the generated
+  `chore(action): clear released changelog entries` message and its
+  `Action-Release-Cleanup: <action>@<original-merge-sha>` / `Release: <action>/vX.Y.Z`
+  trailers, and descend from the published notes commit (or R when notes were a no-op).
+  A failed or pending promotion does not invalidate completed publication/cleanup;
+  a later fresh release may create/update that PR. Informational cycle markers in
+  promotion descriptions are optional and never determine release eligibility.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
   never attach GitHub releases to moving aliases or mark an action release as
   the repository-wide "latest" release.
-- Keep workflow permissions read-only by default. Only the `Release` job
-  grants `GITHUB_TOKEN` contents/pull-request write permissions, with actions read
-  access retained for current-attempt CI verification. It supplies this token as
-  `GH_TOKEN` for notes/publishing/cleanup/promotion; context capture and candidate
-  CI stay read-only. Do not add GitHub App or personal-token dependencies. Pin
-  external actions to full commit SHAs, with version comments. Supply dispatch
-  inputs to scripts via environment variables, not shell interpolation.
+- Keep workflow permissions read-only by default. Only `Release` and the
+  Dependabot auto-merge job grant `GITHUB_TOKEN` contents/pull-request write.
+  `Release` additionally retains actions read access for current-attempt CI
+  verification and supplies the token as `GH_TOKEN` for notes, publishing,
+  cleanup, and promotion; context capture and candidate CI stay read-only. Do not add GitHub
+  App or personal-token dependencies. Pin external actions to full commit SHAs,
+  with version comments. Supply dispatch inputs to scripts via environment
+  variables, not shell interpolation.
+- Keep `Automerge-Dependabot` as one post-CI job and one script. Run only after
+  successful pull-request CI; the script skips missing PR associations before
+  any API call. Merge only open, non-draft `dependabot[bot]` PRs into the
+  repository's default branch. Fetch current PR
+  metadata, compare its head with `workflow_run.head_sha`, and pass the same SHA
+  to the merge API. Skip stale/ineligible PRs and surface API/merge failures.
+  Never bypass branch rules or auto-merge release-promotion PRs.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 
