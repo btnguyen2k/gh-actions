@@ -190,7 +190,8 @@
   missing cleanup even though there is no generated notes commit.
   Incomplete or conflicting publication/cleanup still requires manual reconciliation.
 - Keep one open promotion PR per action into the default branch. Create it when
-  none is open; otherwise reuse it, update its title, and append the new release's
+  none is open; otherwise reuse it, update its title to
+  `Promote release/<action> to <default-branch>`, and append the new release's
   information without replacing existing description text. The PR's source branch
   and cumulative diff advance with each release. Closed or merged PRs do not
   block a new one; ambiguous multiple open matches fail explicitly.

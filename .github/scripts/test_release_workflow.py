@@ -655,7 +655,7 @@ class ReleaseIntegrationTests(ReleaseFixture):
         second = self.complete_release()
         self.assertEqual(len(self.client.prs), 1)
         self.assertEqual(self.client.prs[0]["number"], pr["number"])
-        self.assertEqual(pr["title"], "Promote dummy to main")
+        self.assertEqual(pr["title"], "Promote release/dummy to main")
         self.assertEqual(pr["head"]["sha"], second.cleanup_sha)
         self.assertTrue(pr["body"].startswith(original_body))
         for plan in (first, second):
@@ -774,6 +774,7 @@ class ReleaseIntegrationTests(ReleaseFixture):
         ):
             release.promote(self.root, self.client, self.path)
         self.assertEqual(len(self.client.prs), 1)
+        self.assertEqual(self.client.prs[0]["title"], "Promote release/dummy to main")
         self.assertEqual(len(self.client.writes), 2)
         for text in (
             self.client.prs[0]["body"], summary.read_text(encoding="utf-8"), output.getvalue(),
@@ -908,7 +909,7 @@ class ReleaseIntegrationTests(ReleaseFixture):
                 self.assertEqual(len(self.client.prs), 1)
                 self.assertTrue(self.client.prs[0]["body"].startswith(description or ""))
                 self.assertIn(self.cycle.marker, self.client.prs[0]["body"])
-                self.assertEqual(self.client.prs[0]["title"], "Promote dummy to main")
+                self.assertEqual(self.client.prs[0]["title"], "Promote release/dummy to main")
 
     def test_closed_or_merged_promotions_allow_a_new_pr_for_a_later_release(self):
         first = self.complete_release()
