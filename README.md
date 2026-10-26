@@ -1,6 +1,6 @@
-[![Release](https://img.shields.io/github/release/btnguyen2k/gh-actions.svg?style=flat-square)](RELEASE-NOTES.md)
-[![Actions Status](https://github.com/btnguyen2k/gh-actions/workflows/CI/badge.svg)](https://github.com/btnguyen2k/gh-actions/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE.md)
+[![Actions Status](https://github.com/btnguyen2k/gh-actions/workflows/CI/badge.svg)](https://github.com/btnguyen2k/gh-actions/actions)
+[![Release](https://img.shields.io/github/release/btnguyen2k/gh-actions.svg?style=flat-square)](RELEASE-NOTES.md)
 
 Reusable GitHub actions to reduce repetitive workflow scripting and standardize
 automation across repositories.

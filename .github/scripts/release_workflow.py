@@ -739,7 +739,7 @@ def promote(root: Path, client: GitHub, path: Path) -> None:
     pr = prs[0] if prs else None
     if pr is not None and pr["head"]["sha"] != plan.cleanup_sha:
         raise ValueError("The open promotion PR does not point to the recorded cleanup commit.")
-    title = f"Promote {plan.cycle.action} to {plan.cycle.default_branch}"
+    title = f"Promote {plan.cycle.branch} to {plan.cycle.default_branch}"
     body = (pr["body"] or "") if pr is not None else (
         f"Promotes all unmerged changes from `{plan.cycle.branch}` "
         f"to `{plan.cycle.default_branch}`, including the releases below."
