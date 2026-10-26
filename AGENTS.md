@@ -9,6 +9,9 @@
   and `tests/run.sh`. Keep implementation files, dependency manifests, lockfiles,
   and runtime assets within that action's directory. Choose the runtime per action;
   do not impose a repository-wide application framework or package version.
+- Every action or workflow README must include a dedicated `## License` section
+  that explicitly names the MIT License and uses the absolute license URL
+  `https://github.com/btnguyen2k/gh-actions/blob/main/LICENSE.md`.
 - Keep the root README concise and focused on business value, the action catalog,
   and consumer-facing usage. Keep internal development, CI, and release procedures
   in these instructions, not the README.

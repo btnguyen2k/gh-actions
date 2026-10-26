@@ -12,4 +12,3 @@
 - feat(action): capture PR details with optional API enrichment
 - feat(action): support target SHA overrides
 - feat(action): expose typed JSON context alongside individual outputs
-
