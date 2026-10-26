@@ -53,6 +53,7 @@
   and the files being checked.
 - Test repository tooling with
   `python -m unittest discover --start-directory .github\scripts --pattern "test_*.py"`.
+  Workflow script tests also require Node.js.
 - Run action tests with `python .github\scripts\monorepo.py test`. Each
   `tests/run.sh` runs from its own action directory through Bash, owns its
   dependency setup, and must return a nonzero exit code on failure. CI currently
@@ -220,13 +221,21 @@
   while allowing major/minor alias updates. Consider immutable GitHub releases;
   never attach GitHub releases to moving aliases or mark an action release as
   the repository-wide "latest" release.
-- Keep workflow permissions read-only by default. Only the `Release` job
-  grants `GITHUB_TOKEN` contents/pull-request write permissions, with actions read
-  access retained for current-attempt CI verification. It supplies this token as
-  `GH_TOKEN` for notes/publishing/cleanup/promotion; context capture and candidate
-  CI stay read-only. Do not add GitHub App or personal-token dependencies. Pin
-  external actions to full commit SHAs, with version comments. Supply dispatch
-  inputs to scripts via environment variables, not shell interpolation.
+- Keep workflow permissions read-only by default. Only `Release` and the
+  Dependabot auto-merge job grant `GITHUB_TOKEN` contents/pull-request write.
+  `Release` additionally retains actions read access for current-attempt CI
+  verification and supplies the token as `GH_TOKEN` for notes, publishing,
+  cleanup, and promotion; context capture and candidate CI stay read-only. Do not add GitHub
+  App or personal-token dependencies. Pin external actions to full commit SHAs,
+  with version comments. Supply dispatch inputs to scripts via environment
+  variables, not shell interpolation.
+- Keep `Automerge-Dependabot` as one post-CI job and one script. Run only after
+  successful pull-request CI; the script skips missing PR associations before
+  any API call. Merge only open, non-draft `dependabot[bot]` PRs into the
+  repository's default branch. Fetch current PR
+  metadata, compare its head with `workflow_run.head_sha`, and pass the same SHA
+  to the merge API. Skip stale/ineligible PRs and surface API/merge failures.
+  Never bypass branch rules or auto-merge release-promotion PRs.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 
