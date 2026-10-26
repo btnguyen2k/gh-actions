@@ -172,4 +172,6 @@ tests through Bash. The shipped JavaScript is the runtime artifact; no compilati
 or bundling is needed. Action versions come from `workflow-context/vX.Y.Z` tags;
 this private package is not published to npm.
 
-Licensed under the repository's [MIT license](../LICENSE.md).
+## License
+
+This action is licensed under the [MIT License](https://github.com/btnguyen2k/gh-actions/blob/main/LICENSE.md).
