@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -18,11 +19,191 @@ class RepositoryTestCase(unittest.TestCase):
 
     def add_action(self, name="example-action"):
         directory = self.root / name
-        for filename in ("action.yml", "README.md", "tests/run.sh"):
+        for filename in ("action.yml", "README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             path = directory / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("", encoding="utf-8")
         return directory
+
+
+class ConsoleOutputTests(RepositoryTestCase):
+    def test_configures_utf8_without_changing_stream_error_handling(self):
+        stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="ascii", errors="strict", newline="\n")
+        stderr = io.TextIOWrapper(
+            stderr_bytes, encoding="ascii", errors="backslashreplace", newline="\n",
+        )
+        self.addCleanup(stdout.close)
+        self.addCleanup(stderr.close)
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            monorepo.configure_output()
+            print("ℹ️ Information")
+            print("❌ Error", file=sys.stderr)
+        stdout.flush()
+        stderr.flush()
+        self.assertEqual(stdout_bytes.getvalue(), "ℹ️ Information\n".encode("utf-8"))
+        self.assertEqual(stderr_bytes.getvalue(), "❌ Error\n".encode("utf-8"))
+        self.assertEqual(stdout.errors, "strict")
+        self.assertEqual(stderr.errors, "backslashreplace")
+
+    def test_supports_in_memory_output_capture(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            monorepo.configure_output()
+            print("✅ Success")
+        self.assertEqual(stdout.getvalue(), "✅ Success\n")
+
+    def test_warning_icon_preserves_annotation_metadata_and_escaping(self):
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            monorepo.print_changelog_warnings([(7, "Invalid%\nsection\r")])
+        self.assertEqual(
+            output.getvalue(),
+            "::warning file=.semrelease/this_release,line=7::⚠️ Invalid%25%0Asection%0D\n",
+        )
+
+    def test_cli_emits_utf8_messages_with_ascii_stdio_defaults(self):
+        self.add_action()
+        changelog = self.root / ".semrelease" / "this_release"
+        changelog.parent.mkdir()
+        changelog.write_text(
+            "#!example-action\n- feat(action): test output\n#!bad%name\n- Ignored\n",
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable, "-c",
+            "import sys; from pathlib import Path; import monorepo; "
+            "monorepo.ROOT = Path(sys.argv[1]); "
+            "sys.argv = ['monorepo.py', 'validate-changelog']; monorepo.main()",
+            str(self.root),
+        ]
+        environment = {**os.environ, "PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"}
+        result = subprocess.run(
+            command, cwd=Path(monorepo.__file__).parent, env=environment,
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        output = result.stdout.decode("utf-8")
+        self.assertIn("::warning file=.semrelease/this_release,line=3::⚠️ ", output)
+        self.assertIn("✅ Changelog validation passed", output)
+        changelog.unlink()
+        result = subprocess.run(
+            command, cwd=Path(monorepo.__file__).parent, env=environment,
+            capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.decode("utf-8").startswith("❌ error:"))
+
+
+class ReleaseBranchTests(RepositoryTestCase):
+    def test_accepts_matching_action_with_any_nonempty_prefix(self):
+        for prefix in ("dev", "feature", "hotfix", "release", "custom_prefix.123"):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(monorepo.validate_release_pr_branches(
+                    f"{prefix}/example-action", "release/example-action",
+                ))
+
+    def test_non_release_targets_including_promotion_remain_unrestricted(self):
+        for source, target in (
+            ("release/example-action", "main"),
+            ("main", "dev/example-action"),
+            ("feature/general-cleanup", "main"),
+            ("dependabot/github_actions/checkout", "main"),
+            ("dev/example-action", "dev/second-action"),
+            ("dev/example-action", "release"),
+        ):
+            with self.subTest(source=source, target=target):
+                self.assertFalse(monorepo.validate_release_pr_branches(source, target))
+
+    def test_rejects_mismatched_action_names(self):
+        with self.assertRaisesRegex(ValueError, "PR action mismatch") as error:
+            monorepo.validate_release_pr_branches(
+                "dev/example-action", "release/second-action",
+            )
+        self.assertIn("dev/example-action", str(error.exception))
+        self.assertIn("release/second-action", str(error.exception))
+
+    def test_rejects_unscoped_or_malformed_release_sources(self):
+        for source in (
+            "main", "example-action", "/example-action", "dev/",
+            "feature/nested/example-action", "dev/Example-action", "dev/example_action",
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                ValueError, "must use <prefix>/example-action",
+            ):
+                monorepo.validate_release_pr_branches(source, "release/example-action")
+
+    def test_rejects_malformed_release_targets(self):
+        for target in (
+            "release/", "release/Example-action", "release/example_action",
+            "release/example-action/nested",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                ValueError, "Invalid release PR target branch",
+            ):
+                monorepo.validate_release_pr_branches("dev/example-action", target)
+
+    def test_rejects_missing_or_nontext_branch_metadata(self):
+        for source, target in (
+            ("", "release/example-action"), ("dev/example-action", ""),
+            (None, "release/example-action"), ("dev/example-action", None),
+            (True, "release/example-action"), ("dev/example-action", 1),
+        ):
+            with self.subTest(source=source, target=target), self.assertRaisesRegex(
+                ValueError, "nonempty strings",
+            ):
+                monorepo.validate_release_pr_branches(source, target)
+
+    def test_cli_reports_matching_release_branches_and_non_release_targets(self):
+        for source, target, message in (
+            ("feature/example-action", "release/example-action", "✅ Release PR branches match"),
+            ("release/example-action", "main", "ℹ️ PR target 'main' is not a release branch"),
+        ):
+            output = io.StringIO()
+            with (
+                self.subTest(source=source, target=target),
+                patch.dict(os.environ, {"PR_HEAD_REF": source, "PR_BASE_REF": target}),
+                patch("sys.argv", ["monorepo.py", "validate-pr-branches"]),
+                patch("sys.stdout", output),
+            ):
+                self.assertIsNone(monorepo.main())
+            self.assertIn(message, output.getvalue())
+
+    def test_cli_rejects_mismatch_before_exporting_any_plan_even_with_both_sections(self):
+        self.add_action()
+        self.add_action("second-action")
+        changelog = self.root / ".semrelease" / "this_release"
+        changelog.parent.mkdir()
+        content = "#!example-action\n- First update\n#!second-action\n- Second update\n"
+        changelog.write_text(content, encoding="utf-8", newline="\n")
+        github_output = self.root / "outputs.txt"
+        github_output.write_text("existing=value\n", encoding="utf-8", newline="\n")
+        output, error = io.StringIO(), io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch.dict(os.environ, {
+                "PR_HEAD_REF": "dev/example-action", "PR_BASE_REF": "release/second-action",
+                "GITHUB_OUTPUT": str(github_output),
+            }),
+            patch("sys.argv", ["monorepo.py", "validate-pr-branches"]),
+            patch("sys.stdout", output), patch("sys.stderr", error),
+            self.assertRaises(SystemExit) as result,
+        ):
+            monorepo.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("❌ error: PR action mismatch", error.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(changelog.read_text(encoding="utf-8"), content)
+        self.assertEqual(github_output.read_text(encoding="utf-8"), "existing=value\n")
+
+    def test_cli_requires_explicit_pr_branch_metadata(self):
+        for environment in ({}, {"PR_HEAD_REF": "dev/example-action"}, {"PR_BASE_REF": "main"}):
+            with (
+                self.subTest(environment=environment),
+                patch.dict(os.environ, environment, clear=True),
+                self.assertRaisesRegex(ValueError, "Missing PR branch environment variables"),
+            ):
+                monorepo.validate_pr_branches(self.root)
 
 
 class ActionLayoutTests(RepositoryTestCase):
@@ -37,13 +218,22 @@ class ActionLayoutTests(RepositoryTestCase):
 
     def test_requires_documentation_and_test_entrypoint(self):
         directory = self.add_action()
-        for filename in ("README.md", "tests/run.sh"):
+        for filename in ("README.md", "RELEASE-NOTES.md", "tests/run.sh"):
             with self.subTest(filename=filename):
                 path = directory / filename
                 path.unlink()
-                with self.assertRaisesRegex(ValueError, "missing"):
+                with self.assertRaises(ValueError) as error:
                     monorepo.actions(self.root)
+                self.assertEqual(str(error.exception), f"example-action: missing {filename}.")
                 path.write_text("", encoding="utf-8")
+
+    def test_rejects_directory_in_place_of_release_notes(self):
+        path = self.add_action() / "RELEASE-NOTES.md"
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(ValueError) as error:
+            monorepo.actions(self.root)
+        self.assertEqual(str(error.exception), "example-action: missing RELEASE-NOTES.md.")
 
     def test_rejects_root_metadata_and_alternate_filename(self):
         for path in (self.root / "action.yml", self.root / "example" / "action.yaml"):
@@ -138,14 +328,51 @@ class ActionLayoutTests(RepositoryTestCase):
     @patch("monorepo.subprocess.run")
     def test_validates_workflows_dependabot_and_action_metadata(self, run):
         self.add_action()
+        self.add_action("second-action")
         workflows = self.root / ".github" / "workflows"
         workflows.mkdir(parents=True)
         (workflows / "ci.yml").write_text("", encoding="utf-8")
-        monorepo.validate(self.root)
+        (workflows / "release.yaml").write_text("", encoding="utf-8")
+        output = io.StringIO()
+        log_snapshots = []
+        run.side_effect = lambda *args, **kwargs: log_snapshots.append(output.getvalue())
+        with patch("sys.stdout", output):
+            monorepo.validate(self.root)
         schemas = [call.args[0][4] for call in run.call_args_list]
         self.assertEqual(schemas, [
             "vendor.github-workflows", "vendor.dependabot", "vendor.github-actions",
         ])
+        groups = [
+            "ℹ️ Validating github-workflows:\n"
+            "  - .github/workflows/ci.yml\n"
+            "  - .github/workflows/release.yaml\n",
+            "ℹ️ Validating dependabot:\n"
+            "  - .github/dependabot.yml\n",
+            "ℹ️ Validating github-actions:\n"
+            "  - example-action/action.yml\n"
+            "  - second-action/action.yml\n",
+        ]
+        self.assertEqual(output.getvalue(), "".join(groups))
+        self.assertEqual(
+            log_snapshots, ["".join(groups[:end]) for end in range(1, len(groups) + 1)],
+        )
+
+    @patch("monorepo.subprocess.run")
+    def test_validation_logs_failing_group_and_preserves_errors(self, run):
+        self.add_action()
+        workflows = self.root / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_text("", encoding="utf-8")
+        failure = subprocess.CalledProcessError(1, ["check-jsonschema"])
+        run.side_effect = failure
+        output = io.StringIO()
+        with patch("sys.stdout", output), self.assertRaises(subprocess.CalledProcessError) as result:
+            monorepo.validate(self.root)
+        self.assertIs(result.exception, failure)
+        run.assert_called_once()
+        self.assertEqual(
+            output.getvalue(), "ℹ️ Validating github-workflows:\n  - .github/workflows/ci.yml\n",
+        )
 
     def test_action_schema_accepts_supported_runtimes_and_rejects_missing_runs(self):
         directory = self.add_action()
@@ -201,10 +428,14 @@ class ChangelogTests(RepositoryTestCase):
         path.parent.mkdir(exist_ok=True)
         path.write_text(text, encoding=encoding)
 
-    def report(self, text, branch, encoding="utf-8"):
+    def report(self, text, branch, encoding="utf-8", github_output=None):
         self.write_changelog(text, encoding)
         output = io.StringIO()
-        with patch.dict(os.environ, {"CHANGELOG_BRANCH": branch}), patch("sys.stdout", output):
+        environment = {
+            "CHANGELOG_BRANCH": branch,
+            "GITHUB_OUTPUT": str(github_output) if github_output is not None else "",
+        }
+        with patch.dict(os.environ, environment), patch("sys.stdout", output):
             monorepo.changelog(self.root)
         return output.getvalue()
 
@@ -243,6 +474,19 @@ class ChangelogTests(RepositoryTestCase):
                 ])
                 self.assertEqual(warnings, [])
 
+    def test_versionless_headers_request_automatic_versions(self):
+        for spaces in ("", " ", "    "):
+            with self.subTest(spaces=spaces):
+                sections, warnings = self.parse(
+                    f"#!{spaces}example-action  \r\n- feat(action): add capability\r\n"
+                )
+                self.assertEqual(sections, [
+                    monorepo.ReleaseSection(
+                        "example-action", "", "- feat(action): add capability", 1,
+                    ),
+                ])
+                self.assertEqual(warnings, [])
+
     def test_ignores_comments_but_preserves_note_indentation(self):
         sections, warnings = self.parse(
             "# Preamble\n\n#!example-action/v1.2.3\n"
@@ -255,10 +499,12 @@ class ChangelogTests(RepositoryTestCase):
         invalid = {
             "#!": "expected #!",
             "#!example-action/1.2.3": "expected #!",
+            "#!example-action/v": "expected #!",
             "#!\texample-action/v1.2.3": "expected #!",
             "  #!example-action/v1.2.3": "expected #!",
             "#!Example/v1.2.3": "lowercase kebab-case",
             "#!example_action/v1.2.3": "lowercase kebab-case",
+            "#!*&^dummy": "lowercase kebab-case",
             "#!../v1.2.3": "lowercase kebab-case",
             "#!example-action/v1.2": "MAJOR.MINOR.PATCH",
             "#!example-action/v01.2.3": "MAJOR.MINOR.PATCH",
@@ -301,18 +547,117 @@ class ChangelogTests(RepositoryTestCase):
         ])
 
     def test_rejects_duplicate_and_conflicting_versions_instead_of_picking_one(self):
-        for version in ("1.2.3", "1.2.4"):
-            with self.subTest(version=version):
-                sections, warnings = self.parse(
-                    "#!example-action/v1.2.3\n- First section\n"
-                    f"#!example-action/v{version}\n- Second section\n"
-                    "#!second-action/v2.3.4\n- Valid section\n"
+        for first, second in (
+            ("#!example-action/v1.2.3", "#!example-action/v1.2.3"),
+            ("#!example-action/v1.2.3", "#!example-action/v1.2.4"),
+            ("#!example-action/v1.2.3", "#!example-action"),
+            ("#!example-action", "#!example-action"),
+        ):
+            with self.subTest(first=first, second=second):
+                with self.assertRaisesRegex(monorepo.ChangelogError, (
+                    "Multiple release sections for action 'example-action' at lines 1, 3"
+                )):
+                    self.parse(
+                        f"{first}\n- First section\n{second}\n- Second section\n"
+                        "#!second-action/v2.3.4\n- Valid section\n"
+                    )
+
+    def test_duplicate_headers_fail_even_when_sections_are_empty(self):
+        for first_notes, second_notes in (
+            ("", "- Second update\n"),
+            ("- First update\n", ""),
+            ("# Comment only\n", "# Comment only\n"),
+        ):
+            with self.subTest(first_notes=first_notes, second_notes=second_notes):
+                with self.assertRaisesRegex(monorepo.ChangelogError, "Multiple release sections"):
+                    self.parse(
+                        f"#!example-action/v1.2.3\n{first_notes}"
+                        f"#!example-action/v1.2.4\n{second_notes}"
+                    )
+
+    def test_reports_every_action_with_duplicate_sections(self):
+        with self.assertRaises(monorepo.ChangelogError) as error:
+            self.parse(
+                "#!example-action\n- First\n#!second-action\n- First\n"
+                "#!example-action\n- Second\n#!second-action\n- Second\n"
+            )
+        self.assertIn("action 'example-action' at lines 1, 5", str(error.exception))
+        self.assertIn("action 'second-action' at lines 3, 7", str(error.exception))
+
+    def test_invalid_headers_do_not_count_as_duplicate_sections(self):
+        sections, warnings = self.parse(
+            "#!*&^dummy\n- Invalid name\n"
+            "#!example-action/vnot-semver\n- Invalid version\n"
+            "#!example-action\n- Valid update\n"
+        )
+        self.assertEqual(sections, [
+            monorepo.ReleaseSection("example-action", "", "- Valid update", 5),
+        ])
+        self.assertEqual([line for line, _ in warnings], [1, 3])
+
+    def test_validation_warns_and_ignores_invalid_sections_regardless_of_branch_scope(self):
+        self.write_changelog(
+            "#!example-action\n- First update\n#!*&^dummy\n- Invalid section\n"
+            "#!second-action/v1.2.3\n- Second update\n",
+            encoding="utf-8-sig",
+        )
+        output = io.StringIO()
+        with (
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "feature/second-action"}),
+            patch("sys.stdout", output),
+        ):
+            monorepo.validate_changelog(self.root)
+        self.assertIn("::warning file=.semrelease/this_release,line=3::", output.getvalue())
+        self.assertIn("#!*&^dummy", output.getvalue())
+        self.assertIn("Changelog validation passed (2 non-empty sections).", output.getvalue())
+        self.assertNotIn("- Invalid section", output.getvalue())
+
+    def test_validation_accepts_an_empty_or_cleaned_up_changelog(self):
+        for text in ("", "# Cleaned up\n"):
+            with self.subTest(text=text):
+                self.write_changelog(text)
+                output = io.StringIO()
+                with patch("sys.stdout", output):
+                    monorepo.validate_changelog(self.root)
+                self.assertEqual(
+                    output.getvalue(), "✅ Changelog validation passed (0 non-empty sections).\n",
                 )
-                self.assertEqual(sections, [
-                    monorepo.ReleaseSection("second-action", "2.3.4", "- Valid section", 5),
-                ])
-                self.assertEqual([line for line, _ in warnings], [1, 3])
-                self.assertTrue(all("Multiple release sections" in message for _, message in warnings))
+
+    def test_validation_command_reports_warnings_and_fails_duplicates_outside_branch_scope(self):
+        self.write_changelog(
+            "#!*&^dummy\n- Invalid section\n"
+            "#!example-action/v1.2.3\n- First\n#!example-action/v1.2.4\n- Second\n"
+        )
+        output, error = io.StringIO(), io.StringIO()
+        with (
+            patch("monorepo.ROOT", self.root),
+            patch("sys.argv", ["monorepo.py", "validate-changelog"]),
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "feature/second-action"}),
+            patch("sys.stdout", output),
+            patch("sys.stderr", error),
+            self.assertRaises(SystemExit) as result,
+        ):
+            monorepo.main()
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("::warning file=.semrelease/this_release,line=1::", output.getvalue())
+        self.assertIn("#!*&^dummy", output.getvalue())
+        self.assertNotIn("validation passed", output.getvalue())
+        self.assertIn("action 'example-action' at lines 3, 5", error.getvalue())
+
+    def test_duplicate_sections_cannot_export_a_release_matrix(self):
+        for branch in ("main", "feature/example-action"):
+            with self.subTest(branch=branch):
+                github_output = self.root / "outputs.txt"
+                github_output.write_text("existing=value\n", encoding="utf-8")
+                with self.assertRaises(monorepo.ChangelogError):
+                    self.report(
+                        "#!example-action/v1.2.3\n- First\n"
+                        "#!example-action/v1.2.4\n- Second\n",
+                        branch, github_output=github_output,
+                    )
+                self.assertEqual(
+                    github_output.read_text(encoding="utf-8"), "existing=value\n",
+                )
 
     def test_action_scope_ignores_unrelated_notes_and_invalid_sections(self):
         sections, warnings = self.parse(
@@ -347,8 +692,8 @@ class ChangelogTests(RepositoryTestCase):
                 self.assertIn("Pending releases: 0\n", output)
                 self.assertNotIn("::warning", output)
 
-    def test_common_branches_report_every_actions_version_and_changelog(self):
-        for branch in ("main", "dev", "feature/changelog", ""):
+    def test_unscoped_branches_report_every_actions_version_and_changelog(self):
+        for branch in ("main", "dev", "release", "feature", "/second-action", ""):
             with self.subTest(branch=branch):
                 output = self.report(
                     "#!example-action/v1.2.3\n- First notes\n"
@@ -358,54 +703,59 @@ class ChangelogTests(RepositoryTestCase):
                 self.assertIn("Release scope: all actions\nPending releases: 2\n", output)
                 self.assertIn(
                     "Action: example-action\nVersion: 1.2.3\n"
-                    "Tag: example-action/v1.2.3\nChangelog:\n- First notes\n",
+                    "Tag prefix: example-action/v\nChangelog:\n- First notes\n",
                     output,
                 )
                 self.assertIn(
                     "Action: second-action\nVersion: 2.3.4\n"
-                    "Tag: second-action/v2.3.4\nChangelog:\n- Second notes\n",
+                    "Tag prefix: second-action/v\nChangelog:\n- Second notes\n",
                     output,
                 )
                 self.assertNotIn("::warning", output)
 
-    def test_release_branch_reports_only_its_action(self):
-        output = self.report(
-            "#!example-action/v1.2.3\n- First notes\n"
-            "#!second-action/v2.3.4\n- Second notes\n",
-            "release/second-action",
-        )
-        self.assertIn("Release scope: action 'second-action'\nPending releases: 1\n", output)
-        self.assertIn("Action: second-action\n", output)
-        self.assertIn("- Second notes\n", output)
-        self.assertNotIn("example-action", output)
-        self.assertNotIn("- First notes", output)
-        self.assertNotIn("::warning", output)
+    def test_action_branches_report_only_their_action(self):
+        for prefix in ("release", "dev", "feature", "custom_prefix.123"):
+            with self.subTest(prefix=prefix):
+                output = self.report(
+                    "#!example-action/v1.2.3\n- First notes\n"
+                    "#!second-action/v2.3.4\n- Second notes\n",
+                    f"{prefix}/second-action",
+                )
+                self.assertIn("Release scope: action 'second-action'\nPending releases: 1\n", output)
+                self.assertIn("Action: second-action\n", output)
+                self.assertIn("- Second notes\n", output)
+                self.assertNotIn("example-action", output)
+                self.assertNotIn("- First notes", output)
+                self.assertNotIn("::warning", output)
 
-    def test_release_branch_warns_for_missing_empty_invalid_or_ambiguous_sections(self):
+    def test_action_branches_warn_for_missing_empty_or_invalid_sections(self):
         for text in (
             "",
             "# Cleaned up\n",
             "#!second-action/v2.3.4\n- Other action\n",
             "#!example-action/v1.2.3\n# No notes\n",
+            "#!example-action\n# No notes\n",
             "#!example-action/v01.2.3\n- Invalid version\n",
-            "#!example-action/v1.2.3\n- First\n#!example-action/v1.2.4\n- Second\n",
         ):
-            with self.subTest(text=text):
-                output = self.report(text, "release/example-action")
-                self.assertIn("Pending releases: 0\n", output)
-                self.assertIn(
-                    "::warning file=.semrelease/this_release,line=1::"
-                    "No valid, non-empty release sections found for action 'example-action'",
-                    output,
-                )
+            for prefix in ("release", "dev", "feature", "custom_prefix.123"):
+                with self.subTest(text=text, prefix=prefix):
+                    output = self.report(text, f"{prefix}/example-action")
+                    self.assertIn("Pending releases: 0\n", output)
+                    self.assertIn(
+                        "::warning file=.semrelease/this_release,line=1::⚠️ "
+                        "No valid, non-empty release sections found for action 'example-action'",
+                        output,
+                    )
 
-    def test_malformed_release_branch_never_falls_back_to_all_actions(self):
-        for branch in ("release/", "release/unknown-action", "release/example-action/nested"):
-            with self.subTest(branch=branch):
-                output = self.report("#!example-action/v1.2.3\n- Notes\n", branch)
-                self.assertIn("Pending releases: 0\n", output)
-                self.assertNotIn("Release scope: all actions", output)
-                self.assertIn("No valid, non-empty release sections", output)
+    def test_malformed_action_branch_never_falls_back_to_all_actions(self):
+        for prefix in ("release", "dev", "feature", "custom_prefix.123"):
+            for suffix in ("", "unknown-action", "changelog", "example-action/nested"):
+                branch = f"{prefix}/{suffix}"
+                with self.subTest(branch=branch):
+                    output = self.report("#!example-action/v1.2.3\n- Notes\n", branch)
+                    self.assertIn("Pending releases: 0\n", output)
+                    self.assertNotIn("Release scope: all actions", output)
+                    self.assertIn("No valid, non-empty release sections", output)
 
     def test_reads_utf8_bom_and_preserves_unicode_notes(self):
         output = self.report(
@@ -448,7 +798,7 @@ class ChangelogTests(RepositoryTestCase):
         with (
             patch("monorepo.ROOT", self.root),
             patch("sys.argv", ["monorepo.py", "changelog"]),
-            patch.dict(os.environ, {"CHANGELOG_BRANCH": "main"}),
+            patch.dict(os.environ, {"CHANGELOG_BRANCH": "main", "GITHUB_OUTPUT": ""}),
             patch("sys.stdout", output),
         ):
             self.assertIsNone(monorepo.main())
@@ -466,6 +816,639 @@ class ChangelogTests(RepositoryTestCase):
         self.assertEqual(result.exception.code, 1)
         self.assertIn("error:", error.getvalue())
         self.assertIn("this_release", error.getvalue())
+
+    def test_exports_fixed_and_automatic_versions_with_multiline_changelog(self):
+        github_output = self.root / "outputs.txt"
+        github_output.write_text("existing=value\n", encoding="utf-8")
+        notes = '- feat(action): preserve "quotes"\n- fix(action): handle caf\u00e9\n::warning::literal'
+        output = self.report(
+            f"#!example-action/v1.2.3\n{notes}\n"
+            "#!second-action\n- feat(action): add capability\n",
+            "main", github_output=github_output,
+        )
+        lines = github_output.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 3)
+        values = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(values["existing"], "value")
+        self.assertEqual(values["has-releases"], "true")
+        self.assertEqual(json.loads(values["matrix"]), {"include": [
+            {
+                "action": "example-action", "version": "1.2.3",
+                "tag-prefix": "example-action/v", "change-log": notes,
+            },
+            {
+                "action": "second-action", "version": "",
+                "tag-prefix": "second-action/v", "change-log": "- feat(action): add capability",
+            },
+        ]})
+        self.assertIn("Version: (automatic)\nTag prefix: second-action/v\n", output)
+
+    def test_exported_matrix_respects_any_nonempty_action_branch_prefix(self):
+        for prefix in ("release", "dev", "feature", "custom_prefix.123"):
+            with self.subTest(prefix=prefix):
+                github_output = self.root / "outputs.txt"
+                github_output.write_text("", encoding="utf-8")
+                self.report(
+                    "#!example-action/v1.2.3\n- First notes\n"
+                    "#!second-action\n- Second notes\n",
+                    f"{prefix}/second-action", github_output=github_output,
+                )
+                values = dict(
+                    line.split("=", 1)
+                    for line in github_output.read_text(encoding="utf-8").splitlines()
+                )
+                self.assertEqual(json.loads(values["matrix"]), {"include": [{
+                    "action": "second-action", "version": "",
+                    "tag-prefix": "second-action/v", "change-log": "- Second notes",
+                }]})
+                self.assertEqual(values["has-releases"], "true")
+
+    def test_empty_or_invalid_plan_exports_a_skippable_empty_matrix(self):
+        for text, branch in (
+            ("# Cleaned up\n", "main"),
+            ("#!example-action/v01.2.3\n- Invalid\n", "main"),
+            ("#!example-action\n- Valid\n", "dev/second-action"),
+            ("#!example-action\n- Valid\n", "feature/second-action"),
+        ):
+            with self.subTest(text=text, branch=branch):
+                github_output = self.root / "outputs.txt"
+                github_output.write_text("", encoding="utf-8")
+                self.report(text, branch, github_output=github_output)
+                values = dict(
+                    line.split("=", 1)
+                    for line in github_output.read_text(encoding="utf-8").splitlines()
+                )
+                self.assertEqual(json.loads(values["matrix"]), {"include": []})
+                self.assertEqual(values["has-releases"], "false")
+
+
+class ReleasePreviewTests(RepositoryTestCase):
+    def setUp(self):
+        super().setUp()
+        environment = patch.dict(os.environ, {
+            "ACTION_NAME": "example-action",
+            "RELEASE_RESULT": "SUCCESS",
+            "RELEASE_VERSION": "1.2.3",
+            "RELEASE_NOTES": "## Features\n\n- feat(action): add capability\n",
+            "GITHUB_STEP_SUMMARY": "",
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_reports_all_upstream_outputs_and_appends_a_job_summary(self):
+        summary = self.root / "summary.md"
+        summary.write_text("Existing summary\n\n", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            monorepo.release_preview(self.root)
+        self.assertIn(
+            "✅ Action: example-action\nresult: SUCCESS\nreleaseVersion: 1.2.3\n"
+            "releaseNotes:\n## Features\n\n- feat(action): add capability\n",
+            output.getvalue(),
+        )
+        self.assertEqual(summary.read_text(encoding="utf-8"), (
+            "Existing summary\n\n## ✅ Release preview: `example-action`\n\n"
+            "- result: `SUCCESS`\n- releaseVersion: `1.2.3`\n\n"
+            "### releaseNotes\n\n## Features\n\n- feat(action): add capability\n\n\n"
+        ))
+
+    def test_skipped_result_preserves_empty_outputs(self):
+        os.environ.update(RELEASE_RESULT="SKIPPED", RELEASE_VERSION="", RELEASE_NOTES="")
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            monorepo.release_preview(self.root)
+        self.assertIn("ℹ️ Action: example-action\n", output.getvalue())
+        self.assertIn("result: SKIPPED\nreleaseVersion: \nreleaseNotes:\n", output.getvalue())
+
+    def test_failed_result_is_reported_and_remains_a_failure(self):
+        os.environ.update(RELEASE_RESULT="FAILED", RELEASE_VERSION="", RELEASE_NOTES="")
+        output = io.StringIO()
+        with patch("sys.stdout", output), self.assertRaisesRegex(ValueError, "preview.*failed"):
+            monorepo.release_preview(self.root)
+        self.assertIn("❌ Action: example-action\n", output.getvalue())
+        self.assertIn("result: FAILED\n", output.getvalue())
+
+    def test_rejects_missing_unknown_or_incomplete_outputs(self):
+        for overrides in (
+            {"RELEASE_RESULT": ""},
+            {"RELEASE_RESULT": "UNKNOWN"},
+            {"RELEASE_VERSION": ""},
+            {"RELEASE_NOTES": "   "},
+            {"ACTION_NAME": "../example-action"},
+        ):
+            with self.subTest(overrides=overrides), patch.dict(os.environ, overrides):
+                with self.assertRaises(ValueError):
+                    monorepo.release_preview(self.root)
+        with patch.dict(os.environ):
+            del os.environ["RELEASE_RESULT"]
+            with self.assertRaisesRegex(ValueError, "Missing release preview"):
+                monorepo.release_preview(self.root)
+
+    def test_release_notes_cannot_execute_runner_commands(self):
+        os.environ["RELEASE_NOTES"] = "::error::literal\n::warning::literal\n"
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            monorepo.release_preview(self.root)
+        token = output.getvalue().splitlines()[0].removeprefix("::stop-commands::")
+        protected, remaining = output.getvalue().split(f"::{token}::\n")
+        self.assertIn("::error::literal\n", protected)
+        self.assertEqual(remaining, "")
+
+
+class DependabotAutomergeWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        from ruamel.yaml import YAML
+
+        self.workflow = YAML(typ="safe").load(
+            (monorepo.ROOT / ".github" / "workflows" / "automerge-dependabot.yaml")
+            .read_text(encoding="utf-8")
+        )
+        self.job = self.workflow["jobs"]["automerge"]
+        self.step = self.job["steps"][0]
+        self.head = "a" * 40
+        self.request = {"owner": "example", "repo": "actions", "pull_number": 17}
+        self.pr = {
+            "user": {"login": "dependabot[bot]"},
+            "base": {"ref": "main"},
+            "state": "open",
+            "draft": False,
+            "head": {"sha": self.head},
+        }
+        self.context = {
+            "repo": {"owner": "example", "repo": "actions"},
+            "payload": {
+                "repository": {"default_branch": "main"},
+                "workflow_run": {
+                    "event": "pull_request",
+                    "conclusion": "success",
+                    "actor": {"login": "human-rerunning-ci"},
+                    "head_sha": self.head,
+                    "pull_requests": [{"number": 17, "head": {"sha": self.head}}],
+                },
+            },
+        }
+
+    def run_script(self, *, pr=None, merge=None, error=None):
+        fixture = {
+            "script": self.step["with"]["script"],
+            "context": self.context,
+            "pr": self.pr if pr is None else pr,
+            "merge": {"merged": True} if merge is None else merge,
+            "error": error,
+        }
+        runner = """
+            import fs from "node:fs";
+            const fixture = JSON.parse(fs.readFileSync(0, "utf8"));
+            const calls = [];
+            const messages = [];
+            const respond = (method, data) => async (request) => {
+                calls.push({method, ...request});
+                if (fixture.error?.method === method) {
+                    throw new Error(fixture.error.message);
+                }
+                return {data};
+            };
+            const github = {rest: {pulls: {
+                get: respond("get", fixture.pr),
+                merge: respond("merge", fixture.merge),
+            }}};
+            const logger = {log: (message) => messages.push(message)};
+            const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+            let error = null;
+            try {
+                await new AsyncFunction("github", "context", "console", fixture.script)(
+                    github, fixture.context, logger,
+                );
+            } catch (failure) {
+                error = failure.message;
+            }
+            process.stdout.write(JSON.stringify({calls, messages, error}));
+        """
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", runner],
+            input=json.dumps(fixture), capture_output=True, encoding="utf-8",
+            check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_keeps_one_job_gated_on_successful_pr_ci(self):
+        self.assertEqual(self.workflow["on"], {
+            "workflow_run": {"workflows": ["CI"], "types": ["completed"]},
+        })
+        self.assertEqual(list(self.workflow["jobs"]), ["automerge"])
+        self.assertEqual(" ".join(self.job["if"].split()), (
+            "github.event.workflow_run.event == 'pull_request' && "
+            "github.event.workflow_run.conclusion == 'success'"
+        ))
+        self.assertNotIn("strategy", self.job)
+        self.assertNotIn("concurrency", self.job)
+        self.assertNotIn("continue-on-error", self.job)
+
+    def test_skips_missing_pr_associations_before_any_api_call(self):
+        for associations in ([], None, [{}]):
+            with self.subTest(associations=associations):
+                self.context["payload"]["workflow_run"]["pull_requests"] = associations
+                result = self.run_script()
+                self.assertIsNone(result["error"])
+                self.assertEqual(result["calls"], [])
+                self.assertEqual(result["messages"], ["ℹ️ Skipped: no associated PR."])
+
+    def test_scopes_write_permissions_and_pins_the_only_step(self):
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        self.assertEqual(self.job["permissions"], {
+            "contents": "write", "pull-requests": "write",
+        })
+        self.assertEqual(len(self.job["steps"]), 1)
+        self.assertRegex(
+            self.step["uses"], r"^actions/github-script@[0-9a-f]{40}$",
+        )
+        self.assertEqual(self.step["with"]["github-token"], "${{ secrets.GITHUB_TOKEN }}")
+        self.assertNotIn("continue-on-error", self.step)
+
+    def test_merges_the_ci_head_even_when_a_human_reruns_ci(self):
+        result = self.run_script()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["calls"], [
+            {"method": "get", **self.request},
+            {"method": "merge", **self.request, "sha": self.head},
+        ])
+        self.assertEqual(result["messages"], ["✅ Merged PR #17."])
+
+    def test_skips_ineligible_prs_without_merging(self):
+        for changes in (
+            {"user": {"login": "octocat"}},
+            {"user": {"login": "github-actions[bot]"}},
+            {"user": None},
+            {"base": {"ref": "release/dummy"}},
+            {"state": "closed"},
+            {"state": "closed", "merged": True},
+            {"draft": True},
+        ):
+            with self.subTest(changes=changes):
+                result = self.run_script(pr={**self.pr, **changes})
+                self.assertIsNone(result["error"])
+                self.assertEqual(result["calls"], [{"method": "get", **self.request}])
+                self.assertEqual(result["messages"], [
+                    "ℹ️ Skipped PR #17: not an open, non-draft Dependabot PR "
+                    "into the default branch.",
+                ])
+
+    def test_uses_the_repository_default_branch_instead_of_hardcoded_main(self):
+        self.context["payload"]["repository"]["default_branch"] = "trunk"
+        result = self.run_script()
+        self.assertEqual(result["calls"], [{"method": "get", **self.request}])
+        self.pr["base"]["ref"] = "trunk"
+        result = self.run_script()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["calls"][-1], {
+            "method": "merge", **self.request, "sha": self.head,
+        })
+
+    def test_skips_stale_ci_even_if_associated_pr_metadata_has_advanced(self):
+        latest = "b" * 40
+        self.context["payload"]["workflow_run"]["pull_requests"][0]["head"]["sha"] = latest
+        self.pr["head"]["sha"] = latest
+        result = self.run_script()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["calls"], [{"method": "get", **self.request}])
+        self.assertEqual(result["messages"], [
+            f"ℹ️ Skipped PR #17: head {latest} does not match successful CI {self.head}.",
+        ])
+
+    def test_unsuccessful_merge_response_is_an_error_not_a_success_message(self):
+        result = self.run_script(merge={
+            "merged": False, "message": "Required status checks have not passed",
+        })
+        self.assertEqual(
+            result["error"],
+            "❌ PR #17 was not merged: Required status checks have not passed",
+        )
+        self.assertEqual(result["messages"], [])
+
+    def test_api_errors_including_concurrent_updates_are_not_hidden_or_retried(self):
+        for method, message in (
+            ("get", "403 Forbidden"),
+            ("merge", "405 Required status checks have not passed"),
+            ("merge", "409 Head branch was modified"),
+            ("merge", "500 Internal Server Error"),
+        ):
+            with self.subTest(method=method, message=message):
+                result = self.run_script(error={"method": method, "message": message})
+                self.assertEqual(result["error"], message)
+                self.assertEqual(result["messages"], [])
+                self.assertEqual(
+                    [call["method"] for call in result["calls"]],
+                    ["get"] if method == "get" else ["get", "merge"],
+                )
+
+
+class ReleasePreviewWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        from ruamel.yaml import YAML
+
+        self.workflow = YAML(typ="safe").load(
+            (monorepo.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        self.plan = self.workflow["jobs"]["ParseChangelog"]
+        self.preview = self.workflow["jobs"]["PreviewRelease"]
+
+    def test_pr_retargeting_reruns_ci_and_pairing_is_checked_before_changelog_planning(self):
+        self.assertEqual(
+            self.workflow["on"]["pull_request"]["types"],
+            ["opened", "synchronize", "reopened", "edited"],
+        )
+        steps = self.plan["steps"]
+        setup = next(step for step in steps if step.get("name") == "Set up Python")
+        pairing = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-pr-branches"
+        )
+        validator = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-changelog"
+        )
+        self.assertLess(steps.index(setup), steps.index(pairing))
+        self.assertLess(steps.index(pairing), steps.index(validator))
+        self.assertEqual(pairing["if"], "${{ github.event_name == 'pull_request' }}")
+        self.assertEqual(pairing["env"], {
+            "PR_HEAD_REF": "${{ github.head_ref }}",
+            "PR_BASE_REF": "${{ github.base_ref }}",
+        })
+        self.assertNotIn("continue-on-error", pairing)
+
+    def test_validates_the_whole_changelog_before_branch_scoped_release_planning(self):
+        steps = self.plan["steps"]
+        validator = next(
+            step for step in steps
+            if step.get("run") == "python .github/scripts/monorepo.py validate-changelog"
+        )
+        parser = next(step for step in steps if step.get("id") == "changelog")
+        self.assertLess(steps.index(validator), steps.index(parser))
+        self.assertNotIn("if", validator)
+        self.assertNotIn("continue-on-error", validator)
+
+    def test_connects_branch_scoped_matrix_and_skips_empty_or_deleted_refs(self):
+        self.assertEqual(self.plan["outputs"], {
+            "matrix": "${{ steps.changelog.outputs.matrix }}",
+            "has-releases": "${{ steps.changelog.outputs.has-releases }}",
+        })
+        parser = next(step for step in self.plan["steps"] if step.get("id") == "changelog")
+        self.assertEqual(parser["run"], "python .github/scripts/monorepo.py changelog")
+        self.assertEqual(parser["env"]["CHANGELOG_BRANCH"], (
+            "${{ inputs.target-branch || github.base_ref || "
+            "needs.CaptureContext.outputs.action-target-branch }}"
+        ))
+        self.assertEqual(self.preview["needs"], ["CaptureContext", "ParseChangelog"])
+        self.assertEqual(self.preview["if"], (
+            "${{ !inputs.skip-release-preview && "
+            "needs.ParseChangelog.outputs.has-releases == 'true' "
+            "&& github.event.deleted != true }}"
+        ))
+        self.assertEqual(self.preview["strategy"], {
+            "fail-fast": False,
+            "matrix": "${{ fromJSON(needs.ParseChangelog.outputs.matrix) }}",
+        })
+
+    def test_passes_each_sections_inputs_to_pinned_read_only_dry_run(self):
+        semrelease = next(
+            step for step in self.preview["steps"] if step.get("id") == "semrelease"
+        )
+        self.assertEqual(semrelease["uses"], (
+            "btnguyen2k/action-semrelease@37fe196d36496098bd291e9519c86772ea2e0c0d"
+        ))
+        self.assertEqual(semrelease["with"], {
+            "github-token": "${{ github.token }}",
+            "dry-run": True,
+            "target-sha": "${{ needs.CaptureContext.outputs.target-sha }}",
+            "branches": "${{ github.ref }}",
+            "tag-prefix": "${{ matrix.tag-prefix }}",
+            "version": "${{ matrix.version }}",
+            "change-log": "${{ matrix.change-log }}",
+        })
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        self.assertNotIn("permissions", self.preview)
+        self.assertNotIn("continue-on-error", semrelease)
+
+    def test_captures_outputs_per_action_and_reports_failures_without_hiding_them(self):
+        report = self.preview["steps"][-1]
+        self.assertEqual(report["run"], "python .github/scripts/monorepo.py release-preview")
+        self.assertEqual(report["env"], {
+            "ACTION_NAME": "${{ matrix.action }}",
+            "RELEASE_RESULT": "${{ steps.semrelease.outputs.result }}",
+            "RELEASE_VERSION": "${{ steps.semrelease.outputs.releaseVersion }}",
+            "RELEASE_NOTES": "${{ steps.semrelease.outputs.releaseNotes }}",
+        })
+        self.assertEqual(report["if"], (
+            "${{ !cancelled() && (steps.semrelease.outcome == 'success' "
+            "|| steps.semrelease.outcome == 'failure') }}"
+        ))
+        self.assertNotIn("outputs", self.preview)
+        self.assertNotIn("continue-on-error", self.preview)
+
+
+class CIWorkflowTestCase(unittest.TestCase):
+    def setUp(self):
+        from ruamel.yaml import YAML
+
+        workflow = YAML(typ="safe").load(
+            (monorepo.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        )
+        self.jobs = workflow["jobs"]
+        self.bash = "bash"
+        if sys.platform == "win32":
+            native = Path(monorepo.capture(
+                monorepo.ROOT, "git", "var", "GIT_SHELL_PATH",
+            )).with_name("bash.exe")
+            self.assertTrue(native.is_absolute() and native.is_file())
+            self.bash = str(native)
+
+    def run_step(self, step, environment):
+        return subprocess.run(
+            [
+                self.bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c",
+                step["run"],
+            ],
+            cwd=monorepo.ROOT, env={**os.environ, **environment},
+            capture_output=True, encoding="utf-8", check=False, timeout=10,
+        )
+
+
+class CIContextWorkflowTests(CIWorkflowTestCase):
+    def setUp(self):
+        super().setUp()
+        self.step = next(
+            step for step in self.jobs["CaptureContext"]["steps"]
+            if step.get("name") == "Print workflow context"
+        )
+
+    def test_binds_context_fields_without_changing_outputs_or_release_scope(self):
+        self.assertEqual(self.step["shell"], "bash")
+        self.assertNotIn("${{", self.step["run"])
+        self.assertEqual(self.jobs["CaptureContext"]["outputs"], {
+            "target-sha": "${{ steps.context.outputs.target-sha }}",
+            "action-target-branch": "${{ inputs.target-branch || steps.context.outputs.action-target-branch }}",
+        })
+        planner = next(
+            step for step in self.jobs["ParseChangelog"]["steps"]
+            if step.get("id") == "changelog"
+        )
+        self.assertEqual(self.step["env"], {
+            "EVENT_NAME": "${{ steps.context.outputs.event-name }}",
+            "VALIDATION_SHA": "${{ steps.context.outputs.target-sha }}",
+            "WORKFLOW_REF": "${{ steps.context.outputs.ref }}",
+            "BRANCH": "${{ steps.context.outputs.action-target-branch }}",
+            "TAG": "${{ steps.context.outputs.tag }}",
+            "IS_PR": "${{ steps.context.outputs.is-pr }}",
+            "PR_NUMBER": "${{ steps.context.outputs.pr-number }}",
+            "PR_SOURCE_BRANCH": "${{ steps.context.outputs.pr-head-ref }}",
+            "PR_SOURCE_SHA": "${{ steps.context.outputs.pr-head-sha }}",
+            "PR_TARGET_BRANCH": "${{ steps.context.outputs.pr-base-ref }}",
+            "RELEASE_SCOPE_BRANCH": planner["env"]["CHANGELOG_BRANCH"].replace(
+                "needs.CaptureContext.outputs.", "steps.context.outputs.",
+            ),
+        })
+
+    def test_prints_context_appropriate_branches_refs_and_shas(self):
+        pr = {
+            "EVENT_NAME": "pull_request", "WORKFLOW_REF": "refs/pull/12/merge",
+            "BRANCH": "dev/dummy", "IS_PR": "true", "PR_NUMBER": "12",
+            "PR_SOURCE_BRANCH": "dev/dummy", "PR_SOURCE_SHA": "b" * 40,
+            "PR_TARGET_BRANCH": "release/dummy", "RELEASE_SCOPE_BRANCH": "release/dummy",
+        }
+        pr_lines = [
+            "Workflow ref: refs/pull/12/merge", "PR number: 12",
+            "PR source branch: dev/dummy", f"PR source SHA: {'b' * 40}",
+            "PR target branch: release/dummy",
+        ]
+        cases = (
+            ("pull request", pr, [*pr_lines, "Release scope branch: release/dummy"]),
+            ("branch push", {
+                "EVENT_NAME": "push", "WORKFLOW_REF": "refs/heads/dev/dummy",
+                "BRANCH": "dev/dummy", "RELEASE_SCOPE_BRANCH": "dev/dummy",
+            }, [
+                "Workflow ref: refs/heads/dev/dummy", "Branch: dev/dummy",
+                "Release scope branch: dev/dummy",
+            ]),
+            ("manual branch run", {
+                "EVENT_NAME": "workflow_dispatch", "WORKFLOW_REF": "refs/heads/main",
+                "BRANCH": "main", "RELEASE_SCOPE_BRANCH": "main",
+            }, [
+                "Workflow ref: refs/heads/main", "Branch: main", "Release scope branch: main",
+            ]),
+            ("tag ref", {
+                "EVENT_NAME": "push", "WORKFLOW_REF": "refs/tags/dummy/v1.2.3",
+                "TAG": "dummy/v1.2.3",
+            }, [
+                "Workflow ref: refs/tags/dummy/v1.2.3", "Tag: dummy/v1.2.3",
+            ]),
+            ("explicit validation and scope overrides", {
+                **pr, "VALIDATION_SHA": "b" * 40, "RELEASE_SCOPE_BRANCH": "testing/dummy",
+            }, [*pr_lines, "Release scope branch: testing/dummy"]),
+            ("partial PR details", {
+                "EVENT_NAME": "issue_comment", "IS_PR": "true", "PR_NUMBER": "12",
+                "WORKFLOW_REF": "refs/heads/main",
+            }, [
+                "Workflow ref: refs/heads/main", "PR number: 12",
+                "PR source branch: unknown", "PR source SHA: unknown",
+                "PR target branch: unknown",
+            ]),
+            ("branch names are literal data", {
+                **pr, "PR_SOURCE_BRANCH": "dev/$(printf not-executed)",
+            }, [
+                "Workflow ref: refs/pull/12/merge", "PR number: 12",
+                "PR source branch: dev/$(printf not-executed)", f"PR source SHA: {'b' * 40}",
+                "PR target branch: release/dummy", "Release scope branch: release/dummy",
+            ]),
+        )
+        for name, overrides, expected in cases:
+            environment = {
+                **dict.fromkeys(self.step["env"], ""),
+                "IS_PR": "false", "VALIDATION_SHA": "a" * 40, **overrides,
+            }
+            with self.subTest(name=name):
+                result = self.run_step(self.step, environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [
+                    f"ℹ️ Event: {environment['EVENT_NAME']}",
+                    f"ℹ️ Validation SHA: {environment['VALIDATION_SHA']}",
+                    *(f"ℹ️ {line}" for line in expected),
+                ])
+                self.assertEqual(result.stderr, "")
+
+
+class CIMarkerWorkflowTests(CIWorkflowTestCase):
+    def run_marker(self, name, environment):
+        return self.run_step(self.jobs[name]["steps"][0], environment)
+
+    def test_marker_jobs_have_stable_names_and_run_after_failed_dependencies(self):
+        for name, needs in (
+            ("ValidatePass", "Validate"),
+            ("PreviewReleasePass", ["ParseChangelog", "PreviewRelease"]),
+        ):
+            with self.subTest(name=name):
+                marker = self.jobs[name]
+                self.assertEqual(marker["name"], name)
+                self.assertEqual(marker["needs"], needs)
+                self.assertEqual(marker["if"], "${{ always() }}")
+                self.assertEqual(marker["runs-on"], "ubuntu-latest")
+                self.assertEqual(marker["timeout-minutes"], 5)
+                self.assertNotIn("strategy", marker)
+                self.assertNotIn("continue-on-error", marker)
+                self.assertEqual(len(marker["steps"]), 1)
+                self.assertEqual(marker["steps"][0]["shell"], "bash")
+                self.assertNotIn("continue-on-error", marker["steps"][0])
+
+    def test_marker_inputs_distinguish_intentional_skips_from_upstream_errors(self):
+        self.assertEqual(self.jobs["ValidatePass"]["steps"][0]["env"], {
+            "JOB_RESULT": "${{ needs.Validate.result }}",
+        })
+        self.assertEqual(self.jobs["PreviewReleasePass"]["steps"][0]["env"], {
+            "CHANGELOG_RESULT": "${{ needs.ParseChangelog.result }}",
+            "PREVIEW_RESULT": "${{ needs.PreviewRelease.result }}",
+            "SKIP_EXPECTED": (
+                "${{ inputs.skip-release-preview "
+                "|| needs.ParseChangelog.outputs.has-releases == 'false' "
+                "|| github.event.deleted == true }}"
+            ),
+        })
+
+    def test_validation_marker_requires_success(self):
+        for status in ("success", "failure", "cancelled", "skipped", ""):
+            with self.subTest(status=status):
+                result = self.run_marker("ValidatePass", {"JOB_RESULT": status})
+                self.assertEqual(
+                    result.returncode == 0, status == "success", result.stdout + result.stderr,
+                )
+                if status != "success":
+                    self.assertIn("::error::❌ Validate", result.stdout)
+                else:
+                    self.assertIn("✅ All validation jobs passed.", result.stdout)
+
+    def test_preview_marker_requires_successful_planning_and_success_or_intentional_skip(self):
+        statuses = ("success", "failure", "cancelled", "skipped", "")
+        for changelog in statuses:
+            for preview in statuses:
+                for skip in ("true", "false"):
+                    with self.subTest(changelog=changelog, preview=preview, skip=skip):
+                        result = self.run_marker("PreviewReleasePass", {
+                            "CHANGELOG_RESULT": changelog,
+                            "PREVIEW_RESULT": preview,
+                            "SKIP_EXPECTED": skip,
+                        })
+                        expected = changelog == "success" and (
+                            preview == "success" or preview == "skipped" and skip == "true"
+                        )
+                        self.assertEqual(
+                            result.returncode == 0, expected, result.stdout + result.stderr,
+                        )
+                        if not expected:
+                            self.assertIn("::error::❌ ", result.stdout)
+                        elif preview == "skipped":
+                            self.assertIn("ℹ️ Release preview was intentionally skipped.", result.stdout)
+                        else:
+                            self.assertIn("✅ All release previews passed.", result.stdout)
 
 
 class ReleaseCommandTests(RepositoryTestCase):
