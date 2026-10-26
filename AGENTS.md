@@ -244,8 +244,9 @@
   promotion descriptions are optional and never determine release eligibility.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
-  never attach GitHub releases to moving aliases or mark an action release as
-  the repository-wide "latest" release.
+  never attach GitHub releases to moving aliases. Publish internal `dummy`
+  releases with `make_latest: "false"` and all other action releases with
+  `make_latest: "true"`. The Latest designation is repository-wide, not per action.
 - Keep workflow permissions read-only by default. Only `Release` and the
   Dependabot auto-merge job grant `GITHUB_TOKEN` contents/pull-request write.
   `Release` additionally retains actions read access for current-attempt CI

@@ -642,6 +642,53 @@ class ContextTests(ReleaseFixture):
         self.assertTrue(emit.call_args.kwargs["eligible"])
 
 
+class PublicationTests(unittest.TestCase):
+    def test_make_latest_is_false_only_for_dummy(self):
+        root = Path(".")
+        cycle = release.Cycle(
+            "example/actions", "dummy", "release/dummy", "a" * 40, 17, 7, "main",
+        )
+        plan = release.Plan(
+            cycle=cycle, stage="frozen", version="0.1.0", requested_version="",
+            change_log="- feat(action): example", release_notes="Release notes.",
+            timestamp="2026-01-01T00:00:00+00:00",
+            changelog_digest="a" * 64, section_digest="b" * 64,
+            ci_run_id=17, ci_run_attempt=1, ci_target_sha=cycle.merge_sha,
+            release_sha="b" * 40, history_digest="c" * 64, cleanup_sha="c" * 40,
+        )
+        for action, latest in (
+            ("dummy", "false"),
+            ("workflow-context", "true"),
+            ("automerge-dependabot", "true"),
+            ("other", "true"),
+        ):
+            with self.subTest(action=action):
+                candidate = replace(
+                    plan, cycle=replace(cycle, action=action, branch=f"release/{action}"),
+                )
+                candidate.validate()
+                client = FakeGitHub(root, candidate.cycle)
+                with (
+                    patch("release_workflow.frozen", return_value=candidate),
+                    patch("release_workflow.remote_head", return_value=candidate.release_sha),
+                    patch("release_workflow.require_new_release"),
+                    patch("release_workflow.git"),
+                    patch("monorepo.tag_state", return_value=({}, {})),
+                    patch("monorepo.push_tags"),
+                ):
+                    release.publish(root, client, Path("unused-release-state.json"))
+                self.assertEqual(client.writes, [(
+                    f"repos/{cycle.repository}/releases",
+                    {
+                        "tag_name": candidate.tag,
+                        "target_commitish": candidate.release_sha,
+                        "name": candidate.tag,
+                        "body": candidate.release_notes,
+                        "draft": False, "prerelease": False, "make_latest": latest,
+                    },
+                )])
+
+
 class ReleaseIntegrationTests(ReleaseFixture):
     def test_two_releases_before_main_promotion_reuse_one_cumulative_pr(self):
         first = self.complete_release()

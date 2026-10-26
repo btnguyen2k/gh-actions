@@ -710,7 +710,8 @@ def publish(root: Path, client: GitHub, path: Path) -> None:
     monorepo.push_tags(root, targets, objects, plan.tag)
     existing = client.api(f"repos/{plan.cycle.repository}/releases", "POST", {
         "tag_name": plan.tag, "target_commitish": plan.release_sha, "name": plan.tag,
-        "body": plan.release_notes, "draft": False, "prerelease": False, "make_latest": "false",
+        "body": plan.release_notes, "draft": False, "prerelease": False,
+        "make_latest": "false" if plan.cycle.action == "dummy" else "true",
     })
     print(f"✅ Release: {existing['html_url']}")
 
