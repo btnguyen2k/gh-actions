@@ -1144,6 +1144,158 @@ class DependabotAutomergeWorkflowTests(unittest.TestCase):
                 )
 
 
+class DependabotAutomergeActionTests(unittest.TestCase):
+    def setUp(self):
+        from ruamel.yaml import YAML
+
+        self.directory = monorepo.ROOT / "automerge-dependabot"
+        self.action = YAML(typ="safe").load(
+            (self.directory / "action.yml").read_text(encoding="utf-8")
+        )
+        self.step = self.action["runs"]["steps"][0]
+
+    def run_script(self, *, token="test-token", associated=True, merge_result=None):
+        with tempfile.TemporaryDirectory(prefix="automerge action ") as temporary:
+            directory = Path(temporary)
+            installed = directory / "installed action"
+            installed.mkdir()
+            (installed / "merge.cjs").write_bytes(
+                (self.directory / "merge.cjs").read_bytes()
+            )
+            caller = directory / "unrelated caller"
+            caller.mkdir()
+            fixture = {
+                "script": self.step["with"]["script"],
+                "action_path": str(installed),
+                "token": token,
+                "associated": associated,
+                "merge_result": {"merged": True} if merge_result is None else merge_result,
+            }
+            runner = """
+                import fs from "node:fs";
+                import {createRequire} from "node:module";
+                const fixture = JSON.parse(fs.readFileSync(0, "utf8"));
+                process.env.ACTION_PATH = fixture.action_path;
+                process.env.ACTION_TOKEN = fixture.token;
+                const head = "a".repeat(40);
+                const calls = [];
+                const outputs = {};
+                const respond = (method, data) => async (request) => {
+                    calls.push({method, ...request});
+                    return {data};
+                };
+                const github = {rest: {pulls: {
+                    get: respond("get", {
+                        user: {login: "dependabot[bot]"}, base: {ref: "main"},
+                        state: "open", draft: false, head: {sha: head},
+                    }),
+                    merge: respond("merge", fixture.merge_result),
+                }}};
+                const context = {
+                    eventName: "workflow_run",
+                    repo: {owner: "consumer", repo: "project"},
+                    payload: {
+                        action: "completed",
+                        repository: {default_branch: "main"},
+                        workflow_run: {
+                            event: "pull_request", conclusion: "success", head_sha: head,
+                            pull_requests: fixture.associated ? [{number: 17}] : [],
+                        },
+                    },
+                };
+                const core = {setOutput: (name, value) => {outputs[name] = String(value);}};
+                const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+                let error = null;
+                try {
+                    await new AsyncFunction("github", "context", "core", "require", fixture.script)(
+                        github, context, core, createRequire(import.meta.url),
+                    );
+                } catch (failure) {
+                    error = failure.message;
+                }
+                process.stdout.write(JSON.stringify({calls, outputs, error}));
+            """
+            result = subprocess.run(
+                ["node", "--input-type=module", "-e", runner],
+                input=json.dumps(fixture), cwd=caller, capture_output=True,
+                encoding="utf-8", check=False, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_composite_pins_github_script_and_maps_inputs_and_outputs(self):
+        self.assertEqual(self.action["runs"]["using"], "composite")
+        self.assertEqual(len(self.action["runs"]["steps"]), 1)
+        self.assertEqual(self.step["id"], "merge")
+        self.assertRegex(
+            self.step["uses"], r"^actions/github-script@[0-9a-f]{40}$",
+        )
+        self.assertEqual(list(self.action["inputs"]), ["github-token"])
+        self.assertEqual(
+            self.action["inputs"]["github-token"]["default"], "${{ github.token }}",
+        )
+        self.assertEqual(self.step["with"]["github-token"], "${{ inputs.github-token }}")
+        self.assertEqual(self.step["env"], {
+            "ACTION_PATH": "${{ github.action_path }}",
+            "ACTION_TOKEN": "${{ inputs.github-token }}",
+        })
+        self.assertEqual(set(self.action["outputs"]), {"status", "reason", "pr-number"})
+        for name, output in self.action["outputs"].items():
+            self.assertEqual(output["value"], "${{ steps.merge.outputs." + name + " }}")
+        self.assertNotIn("${{", self.step["with"]["script"])
+        self.assertNotIn("continue-on-error", self.step)
+
+    def test_dependabot_monitors_the_nested_external_action_pin(self):
+        from ruamel.yaml import YAML
+
+        dependabot = YAML(typ="safe").load(
+            (monorepo.ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        )
+        updates = next(
+            update for update in dependabot["updates"]
+            if update["package-ecosystem"] == "github-actions"
+        )
+        self.assertIn("/", updates["directories"])
+        self.assertIn("/automerge-dependabot", updates["directories"])
+
+    def test_bundled_script_works_from_another_repository_and_path_with_spaces(self):
+        result = self.run_script()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["outputs"], {
+            "status": "merged", "reason": "", "pr-number": "17",
+        })
+        request = {"owner": "consumer", "repo": "project", "pull_number": 17}
+        self.assertEqual(result["calls"], [
+            {"method": "get", **request},
+            {"method": "merge", **request, "sha": "a" * 40},
+        ])
+
+    def test_expected_skips_are_exposed_as_outputs(self):
+        result = self.run_script(associated=False)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["calls"], [])
+        self.assertEqual(result["outputs"], {
+            "status": "skipped", "reason": "no-associated-pr", "pr-number": "",
+        })
+
+    def test_empty_tokens_fail_without_api_calls_or_success_outputs(self):
+        for token in ("", " \t\n"):
+            with self.subTest(token=token):
+                result = self.run_script(token=token)
+                self.assertEqual(result["error"], "github-token must be a nonempty token.")
+                self.assertEqual(result["calls"], [])
+                self.assertEqual(result["outputs"], {})
+
+    def test_merge_failure_does_not_emit_success_outputs(self):
+        result = self.run_script(merge_result={
+            "merged": False, "message": "Required status checks have not passed",
+        })
+        self.assertEqual(
+            result["error"], "PR #17 was not merged: Required status checks have not passed",
+        )
+        self.assertEqual(result["outputs"], {})
+
+
 class ReleasePreviewWorkflowTests(unittest.TestCase):
     def setUp(self):
         from ruamel.yaml import YAML

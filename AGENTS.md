@@ -35,6 +35,9 @@
 - Avoid runtime dependencies on sibling action directories. If shared source is
   introduced, bundle it into each consumer where appropriate and test/release
   every affected action independently.
+- Include composite action directories in the `github-actions` update entry in
+  `.github/dependabot.yml` when they reference external actions. The root `/`
+  scan does not cover nested action metadata.
 - Never interpolate untrusted contexts or inputs directly into shell code. Pass
   values through environment variables or arguments and quote them. Do not log
   secrets; use least-privilege tokens and explicit, actionable failures.
@@ -248,6 +251,10 @@
   metadata, compare its head with `workflow_run.head_sha`, and pass the same SHA
   to the merge API. Skip stale/ineligible PRs and surface API/merge failures.
   Never bypass branch rules or auto-merge release-promotion PRs.
+- The reusable `automerge-dependabot` action independently enforces these event
+  and merge guards, returning `status`, `reason`, and `pr-number` for caller-owned
+  presentation. Keep it checkout-free and self-contained. Adopt it in the
+  repository workflow only after release, using a published commit SHA.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 
