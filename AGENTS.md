@@ -174,6 +174,16 @@
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable
   release in their respective lines, never the most recently published by date.
+- After every public action release, refresh its `# Version: X.Y.Z` comment at
+  the top of `<action>/action.yml`, the short latest-version/tag line near the top
+  of `<action>/README.md`, all applicable usage examples, and its latest-version
+  release link in the root README's Actions table. Use the latest published
+  stable `<action>/vX.Y.Z` tag; never add an unsupported top-level `version` key.
+  Exclude the internal `dummy` action. Keep these follow-up source/documentation
+  updates outside the controlled release-notes-only writer.
+- If an action has no published stable GitHub Release, use `0.0.0` in its version
+  comment and README version line. Label it as unreleased and do not link to or
+  use nonexistent release tags in examples.
 - Do not create unprefixed repository-wide version tags or bump unaffected
   actions. A tag selects a whole-repository snapshot but releases only the named
   action.
