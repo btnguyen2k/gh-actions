@@ -1,3 +1,4 @@
+# Version: 0.1.0
 name: Automerge Dependabot
 description: Merge an eligible Dependabot PR after successful CI for its current head.
 

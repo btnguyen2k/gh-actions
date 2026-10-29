@@ -125,12 +125,32 @@ class ReleaseFixture(unittest.TestCase):
         for action in ("dummy", "other"):
             directory = self.root / action
             directory.mkdir()
-            (directory / "action.yml").write_text("name: test\n", encoding="utf-8", newline="\n")
+            version = "0.0.1" if action == "dummy" else "0.0.0"
+            url = f"https://github.com/example/actions/releases/tag/{action}/v{version}"
+            version_line = (
+                f"**Version:** [v{version}]({url})" if action == "dummy"
+                else "**Latest version:** 0.0.0"
+            )
+            (directory / "action.yml").write_text(
+                f"# Version: {version}\nname: test\n", encoding="utf-8", newline="\n",
+            )
+            (directory / "README.md").write_text(
+                f"# {action}\n\n{version_line}\n(tag: `{action}/v{version}`).\n\n"
+                f"uses: example/actions/{action}@{action}/v{version}\n"
+                f"uses: example/actions/not-{action}@not-{action}/v3.0.0\n"
+                "uses: example/external@v4.0.0\n",
+                encoding="utf-8", newline="\n",
+            )
             (directory / "main.sh").write_text("echo unchanged\n", encoding="utf-8", newline="\n")
             (directory / "RELEASE-NOTES.md").write_text(
                 f"# Release Notes - {action}\n\n## v0.0.1\n\nOld notes.\n",
                 encoding="utf-8", newline="\n",
             )
+        (self.root / "README.md").write_text(
+            "# Actions\n\n| Action | Latest version | Benefit |\n| --- | --- | --- |\n"
+            "| [other](other/README.md) | 0.0.0 | Other action. |\n",
+            encoding="utf-8", newline="\n",
+        )
         (self.root / ".semrelease").mkdir()
         (self.root / ".semrelease" / "this_release").write_text(
             "# Shared staging file\n\n#!dummy\n- feat(action): do the thing\n\n"
@@ -190,6 +210,19 @@ class ReleaseFixture(unittest.TestCase):
         if promote:
             release.promote(self.root, self.client, self.path)
         return plan
+
+    def select_action(self, action, version):
+        branch = f"release/{action}"
+        release.git(self.root, "branch", branch, self.merge)
+        release.git(self.root, "push", "--quiet", "origin", branch)
+        self.cycle = replace(self.cycle, action=action, branch=branch)
+        self.client = FakeGitHub(self.root, self.cycle)
+        values = {
+            "ACTION_NAME": action, "RELEASE_BRANCH": branch, "CAPTURED_BRANCH": branch,
+            "GITHUB_REF": f"refs/heads/{branch}", "RELEASE_VERSION": version,
+        }
+        self.environment.update(values)
+        os.environ.update(values)
 
     def start_cycle(self, parent, version="0.2.0"):
         run_id = self.cycle.source_run_id + 1
@@ -398,9 +431,9 @@ class CalculationTests(ReleaseFixture):
     def test_plan_rejects_wrong_types_schemas_and_cycles(self):
         plan = self.calculate()
         for changes in (
-            {"schema": 2}, {"ci_run_id": True}, {"ci_run_id": 18}, {"release_notes": None},
+            {"schema": 1}, {"ci_run_id": True}, {"ci_run_id": 18}, {"release_notes": None},
             {"ci_target_sha": "f" * 40}, {"changelog_digest": "bad"},
-            {"timestamp": "2026-01-01T00:00:00"},
+            {"timestamp": "2026-01-01T00:00:00"}, {"release_digests": None},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(plan, **changes).validate()
@@ -482,6 +515,30 @@ class ContextTests(ReleaseFixture):
             release.context(self.root, self.client, self.path)
         self.assertTrue(emit.call_args.kwargs["eligible"])
 
+    def test_completed_metadata_only_release_allows_another_cycle(self):
+        merge = release.commit_file(
+            self.root, self.merge, "dummy/action.yml", b"# Version: 0.0.0\nname: test\n",
+            "2026-01-01T00:00:00+00:00", "Reset version metadata\n",
+        )
+        release.push_branch(self.root, self.cycle.branch, self.merge, merge)
+        self.merge = merge
+        self.cycle = replace(self.cycle, merge_sha=merge)
+        self.client = FakeGitHub(self.root, self.cycle)
+        with patch.dict(os.environ, {
+            "MERGE_SHA": merge, "CAPTURED_SHA": merge, "CI_TARGET_SHA": merge,
+            "RELEASE_VERSION": "0.0.1", "RELEASE_NOTES": "Old notes.",
+        }):
+            first = self.complete_release(promote=False)
+        self.assertNotEqual(first.release_sha, first.cycle.merge_sha)
+        self.assertEqual(
+            release.git(self.root, "diff-tree", "--no-commit-id", "--name-only", "-r", first.release_sha),
+            "dummy/action.yml",
+        )
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+
     def test_legacy_tag_without_a_managed_release_merge_does_not_require_cleanup(self):
         release.git(self.root, "tag", "dummy/v0.0.1", self.merge)
         release.git(self.root, "push", "--quiet", "origin", "refs/tags/dummy/v0.0.1")
@@ -555,25 +612,53 @@ class ContextTests(ReleaseFixture):
             release.context(self.root, self.client, self.path)
         self.assertFalse(self.client.writes)
 
-    def test_prior_cleanup_without_a_published_release_blocks_another_cycle(self):
+    def test_prior_cleanup_without_a_published_release_warns_and_allows_another_cycle(self):
         first = self.complete_release(promote=False)
         del self.client.releases[first.tag]
         self.start_cycle(first.cleanup_sha)
-        with self.assertRaisesRegex(ValueError, "Publication.*must complete"):
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
             release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing GitHub Release", output.getvalue())
         self.assertEqual(len(self.client.writes), 1)
 
-    def test_prior_cleanup_with_a_missing_or_moved_full_tag_blocks_another_cycle(self):
+    def test_missing_historical_tag_warns_but_moved_tag_still_blocks_another_cycle(self):
         first = self.complete_release(promote=False)
         self.start_cycle(first.cleanup_sha)
         release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{first.tag}")
-        with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
             release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing immutable tag", output.getvalue())
         release.git(
             self.root, "push", "--quiet", "origin", f"{first.cycle.merge_sha}:refs/tags/{first.tag}",
         )
+        del self.client.releases[first.tag]
         with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
             release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_missing_historical_release_and_tag_warn_and_allow_another_cycle(self):
+        first = self.complete_release(promote=False)
+        del self.client.releases[first.tag]
+        release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{first.tag}")
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing GitHub Release and immutable tag", output.getvalue())
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_historical_release_lookup_errors_remain_fatal(self):
+        first = self.complete_release(promote=False)
+        self.start_cycle(first.cleanup_sha)
+        error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"gh: Forbidden (HTTP 403)")
+        with patch.object(self.client, "optional", side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.context(self.root, self.client, self.path)
         self.assertEqual(len(self.client.writes), 1)
 
     def test_prior_draft_or_prerelease_is_not_completed_publication(self):
@@ -654,7 +739,9 @@ class PublicationTests(unittest.TestCase):
             timestamp="2026-01-01T00:00:00+00:00",
             changelog_digest="a" * 64, section_digest="b" * 64,
             ci_run_id=17, ci_run_attempt=1, ci_target_sha=cycle.merge_sha,
-            release_sha="b" * 40, history_digest="c" * 64, cleanup_sha="c" * 40,
+            release_sha="b" * 40,
+            release_digests={filename: "c" * 64 for filename in release.release_paths("dummy")},
+            cleanup_sha="c" * 40,
         )
         for action, latest in (
             ("dummy", "false"),
@@ -665,6 +752,7 @@ class PublicationTests(unittest.TestCase):
             with self.subTest(action=action):
                 candidate = replace(
                     plan, cycle=replace(cycle, action=action, branch=f"release/{action}"),
+                    release_digests={filename: "c" * 64 for filename in release.release_paths(action)},
                 )
                 candidate.validate()
                 client = FakeGitHub(root, candidate.cycle)
@@ -689,7 +777,121 @@ class PublicationTests(unittest.TestCase):
                 )])
 
 
+class MetadataTests(ReleaseFixture):
+    def test_missing_or_duplicate_markers_fail_instead_of_silently_skipping_updates(self):
+        self.select_action("other", "2.0.0")
+        plan = self.calculate()
+        catalog = release.run(self.root, "git", "show", f"{self.merge}:README.md")
+        for filename, content in (
+            ("other/action.yml", b"name: test\n"),
+            ("other/README.md", b"# Other\n"),
+            ("other/README.md", b"# Other\n\n**Version:** 0.0.0\n\n**Version:** 0.0.0\n"),
+            ("README.md", b"# Actions\n"),
+            ("README.md", catalog + b"| [other](other/README.md) | 0.0.0 | Duplicate. |\n"),
+        ):
+            with self.subTest(filename=filename, content=content):
+                merge = release.commit_file(
+                    self.root, self.merge, filename, content, plan.timestamp, "Invalid marker\n",
+                )
+                candidate = replace(
+                    plan, cycle=replace(self.cycle, merge_sha=merge), ci_target_sha=merge,
+                )
+                with self.assertRaisesRegex(ValueError, "exactly one"):
+                    release.release_contents(self.root, candidate)
+        self.assertEqual(release.remote_head(self.root, self.cycle.branch), self.merge)
+        self.assertFalse(self.client.writes)
+
+    def test_preserves_bom_crlf_and_unrelated_tags_in_metadata(self):
+        plan = self.calculate()
+        originals = {
+            filename: b"\xef\xbb\xbf" + release.run(
+                self.root, "git", "show", f"{self.merge}:{filename}",
+            ).replace(b"\n", b"\r\n")
+            for filename in ("dummy/action.yml", "dummy/README.md")
+        }
+        merge = release.commit_files(
+            self.root, self.merge, originals, plan.timestamp, "Windows metadata\n",
+        )
+        candidate = replace(plan, cycle=replace(self.cycle, merge_sha=merge), ci_target_sha=merge)
+        contents = release.release_contents(self.root, candidate)
+        self.assertEqual(
+            contents["dummy/action.yml"],
+            b"\xef\xbb\xbf# Version: 0.1.0\r\nname: test\r\n",
+        )
+        readme = contents["dummy/README.md"]
+        self.assertTrue(readme.startswith(b"\xef\xbb\xbf# dummy\r\n"))
+        self.assertNotIn(b"\n", readme.replace(b"\r\n", b""))
+        self.assertIn(b"dummy@dummy/v0.1.0\r\n", readme)
+        self.assertIn(b"not-dummy@not-dummy/v3.0.0\r\n", readme)
+        self.assertIn(b"example/external@v4.0.0\r\n", readme)
+
+    def test_freeze_validates_digests_for_all_and_only_controlled_release_files(self):
+        self.select_action("other", "2.0.0")
+        plan = self.prepare()
+        for changes in (
+            {},
+            {**plan.release_digests, "other/main.sh": "a" * 64},
+            {**plan.release_digests, "README.md": False},
+        ):
+            with self.subTest(digests=changes), self.assertRaisesRegex(ValueError, "digests"):
+                replace(plan, release_digests=changes).validate()
+        head = self.merge
+        for filename in plan.release_digests:
+            with self.subTest(filename=filename):
+                content = release.run(self.root, "git", "show", f"{plan.release_sha}:{filename}")
+                changed = release.commit_file(
+                    self.root, plan.release_sha, filename, content + b"Changed\n",
+                    plan.timestamp, "Unexpected metadata edit\n",
+                )
+                release.push_branch(self.root, self.cycle.branch, head, changed)
+                head = changed
+                release.save(self.path, replace(plan, release_sha=changed))
+                with self.assertRaisesRegex(ValueError, "does not match the prepared release plan"):
+                    release.freeze(self.root, self.client, self.path)
+                self.assertEqual(release.load(self.path, self.cycle).stage, "prepared")
+        self.assertIsNone(self.remote_tag(plan.tag))
+        self.assertFalse(self.client.writes)
+
+
 class ReleaseIntegrationTests(ReleaseFixture):
+    def test_public_release_updates_zero_baseline_and_catalog_without_staging_local_edits(self):
+        self.select_action("other", "2.0.0")
+        (self.root / "README.md").write_bytes(b"Unrelated local catalog draft\n")
+        release.git(self.root, "add", "README.md")
+        plan = self.complete_release()
+        self.assertEqual(
+            set(release.git(
+                self.root, "diff-tree", "--no-commit-id", "--name-only", "-r", plan.release_sha,
+            ).splitlines()),
+            {"other/action.yml", "other/README.md", "other/RELEASE-NOTES.md", "README.md"},
+        )
+        metadata = release.run(self.root, "git", "show", f"{plan.release_sha}:other/action.yml")
+        self.assertEqual(metadata, b"# Version: 2.0.0\nname: test\n")
+        readme = release.run(self.root, "git", "show", f"{plan.release_sha}:other/README.md")
+        self.assertIn(
+            b"**Latest version:** [v2.0.0](https://github.com/example/actions/releases/tag/other/v2.0.0)",
+            readme,
+        )
+        self.assertIn(b"(tag: `other/v2.0.0`).", readme)
+        self.assertIn(b"other@other/v2.0.0\n", readme)
+        self.assertIn(b"not-other@not-other/v3.0.0\n", readme)
+        self.assertIn(b"example/external@v4.0.0\n", readme)
+        catalog = release.run(self.root, "git", "show", f"{plan.release_sha}:README.md")
+        self.assertEqual(
+            catalog,
+            b"# Actions\n\n| Action | Latest version | Benefit |\n| --- | --- | --- |\n"
+            b"| [other](other/README.md) | "
+            b"[v2.0.0](https://github.com/example/actions/releases/tag/other/v2.0.0) | Other action. |\n",
+        )
+        for filename in ("dummy/action.yml", "dummy/README.md", "dummy/RELEASE-NOTES.md"):
+            self.assertEqual(
+                release.run(self.root, "git", "show", f"{plan.release_sha}:{filename}"),
+                release.run(self.root, "git", "show", f"{self.merge}:{filename}"),
+            )
+        self.assertEqual(self.remote_tag("other/v2.0.0"), plan.release_sha)
+        self.assertEqual(release.git(self.root, "diff", "--cached", "--name-only"), "README.md")
+        self.assertEqual((self.root / "README.md").read_bytes(), b"Unrelated local catalog draft\n")
+
     def test_two_releases_before_main_promotion_reuse_one_cumulative_pr(self):
         first = self.complete_release()
         pr = self.client.prs[0]
@@ -733,8 +935,10 @@ class ReleaseIntegrationTests(ReleaseFixture):
         release.git(self.root, "add", "dummy/main.sh")
         plan = self.freeze()
         self.assertEqual(
-            release.git(self.root, "diff-tree", "--no-commit-id", "--name-only", "-r", plan.release_sha),
-            "dummy/RELEASE-NOTES.md",
+            set(release.git(
+                self.root, "diff-tree", "--no-commit-id", "--name-only", "-r", plan.release_sha,
+            ).splitlines()),
+            {"dummy/RELEASE-NOTES.md", "dummy/action.yml", "dummy/README.md"},
         )
         self.assertEqual(
             release.git(self.root, "diff-tree", "--no-commit-id", "--name-only", "-r", plan.cleanup_sha),
@@ -743,6 +947,18 @@ class ReleaseIntegrationTests(ReleaseFixture):
         history = release.run(self.root, "git", "show", f"{plan.release_sha}:dummy/RELEASE-NOTES.md")
         self.assertTrue(history.startswith(b"# Release Notes - dummy\n\n## v0.1.0\n"))
         self.assertLess(history.index(b"## v0.1.0"), history.index(b"## v0.0.1"))
+        self.assertEqual(
+            release.run(self.root, "git", "show", f"{plan.release_sha}:README.md"),
+            release.run(self.root, "git", "show", f"{self.merge}:README.md"),
+        )
+        self.assertIn(
+            b"# Version: 0.1.0\n",
+            release.run(self.root, "git", "show", f"{plan.release_sha}:dummy/action.yml"),
+        )
+        self.assertIn(
+            b"dummy@dummy/v0.1.0\n",
+            release.run(self.root, "git", "show", f"{plan.release_sha}:dummy/README.md"),
+        )
         release.publish(self.root, self.client, self.path)
         for tag in ("dummy/v0.1.0", "dummy/v0", "dummy/v0.1"):
             self.assertEqual(self.remote_tag(tag), plan.release_sha)
@@ -844,7 +1060,7 @@ class ReleaseIntegrationTests(ReleaseFixture):
         self.assertEqual(self.remote_tag(plan.tag), plan.release_sha)
         self.assertFalse(self.client.writes)
 
-    def test_existing_exact_notes_entry_needs_no_preparation_commit(self):
+    def test_matching_notes_and_version_metadata_need_no_preparation_commit(self):
         with patch.dict(os.environ, {"RELEASE_VERSION": "0.0.1", "RELEASE_NOTES": "Old notes."}):
             self.calculate()
         release.prepare(self.root, self.client, self.path)
@@ -882,9 +1098,20 @@ class ReleaseIntegrationTests(ReleaseFixture):
 
     def test_missing_publication_cannot_remove_staged_notes(self):
         plan = self.freeze()
-        with self.assertRaisesRegex(ValueError, "Publication"):
-            release.cleanup(self.root, self.client, self.path)
+        for command in (release.cleanup, release.promote):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(ValueError, "Publication"):
+                command(self.root, self.client, self.path)
         self.assertEqual(release.remote_head(self.root, self.cycle.branch), plan.release_sha)
+
+    def test_missing_current_tag_blocks_cleanup_and_promotion(self):
+        plan = self.freeze()
+        release.publish(self.root, self.client, self.path)
+        release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{plan.tag}")
+        for command in (release.cleanup, release.promote):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(ValueError, "immutable tag"):
+                command(self.root, self.client, self.path)
+        self.assertEqual(release.remote_head(self.root, self.cycle.branch), plan.release_sha)
+        self.assertEqual(len(self.client.writes), 1)
 
     def test_conflicting_github_release_is_never_overwritten(self):
         plan = self.freeze()
@@ -1137,7 +1364,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         required = [
             "Select the pinned action section",
             "Calculate release version and notes", "Validate and record the calculation",
-            "Prepare the notes-only and cleanup commits", "Commit the release-notes update",
+            "Prepare release metadata, notes, and cleanup commits", "Commit release metadata and notes",
             "Freeze release plan",
             "Publish immutable release and compatibility aliases",
             "Clean only the published changelog section", "Create or update the promotion PR for manual merge",
@@ -1164,7 +1391,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.named["Freeze release plan"]["run"],
             "python .github/scripts/release_workflow.py freeze",
         )
-        self.assertNotIn("if", self.named["Prepare the notes-only and cleanup commits"])
+        self.assertNotIn("if", self.named["Prepare release metadata, notes, and cleanup commits"])
         self.assertFalse(any(step.get("continue-on-error") for step in self.steps))
 
     def test_only_release_job_can_write_with_github_token(self):
@@ -1179,7 +1406,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         token = self.jobs["Release"]["env"]["GH_TOKEN"]
         self.assertEqual(token, "${{ github.token }}")
         for name in (
-            "Commit the release-notes update", "Publish immutable release and compatibility aliases",
+            "Commit release metadata and notes", "Publish immutable release and compatibility aliases",
             "Clean only the published changelog section", "Create or update the promotion PR for manual merge",
         ):
             self.assertEqual(self.named[name].get("env", {}).get("GH_TOKEN", token), "${{ github.token }}")

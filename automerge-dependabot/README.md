@@ -1,5 +1,8 @@
 # automerge-dependabot
 
+**Latest version:** [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/automerge-dependabot/v0.1.0)
+(tag: `automerge-dependabot/v0.1.0`).
+
 Merge an open, non-draft Dependabot PR into the workflow repository's default
 branch after successful CI for its current head. No checkout, package installation,
 or build step is required. The action never executes PR code or downloads
@@ -14,14 +17,9 @@ that CI succeeds.
 The caller chooses the runner and controls the trigger, permissions, and
 human-facing messages.
 
-You can use a published version tag or the full commit SHA of that action's
-release. Version-tag references include the action name, for example
-`btnguyen2k/gh-actions/automerge-dependabot@automerge-dependabot/v0.1.0`
-(replace `v0.1.0` with your chosen published version).
-
-For reproducibility and stronger supply-chain security, prefer the full released
-commit SHA. Replace `<released-commit-sha>` below with that SHA, or use the
-selected action-prefixed version tag instead.
+The example below uses the latest published action-prefixed version tag.
+For reproducibility and stronger supply-chain security, prefer replacing the
+tag with that release's full commit SHA.
 
 ```yaml
 # Automatically merge PRs from dependabot
@@ -48,7 +46,7 @@ jobs:
     steps:
       - name: Merge PR
         id: merge
-        uses: btnguyen2k/gh-actions/automerge-dependabot@<released-commit-sha>
+        uses: btnguyen2k/gh-actions/automerge-dependabot@automerge-dependabot/v0.1.0
         with:
           github-token: ${{ github.token }}
 ```

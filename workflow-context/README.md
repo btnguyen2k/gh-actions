@@ -1,19 +1,17 @@
 # workflow-context
 
+**Latest version:** [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/workflow-context/v0.1.0)
+(tag: `workflow-context/v0.1.0`).
+
 Capture the workflow trigger, target SHA/branch, pull request details, and run
 metadata as action outputs. No checkout is required. The action uses JavaScript
 on Node.js 24 with no external dependencies or build step.
 
 ## Usage
 
-You can use a published version tag or the full commit SHA of that action's
-release. Version-tag references include the action name, for example
-`btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0`
-(replace `v0.1.0` with your chosen published version).
-
-For reproducibility and stronger supply-chain security, prefer the full released
-commit SHA. Replace `<released-commit-sha>` in the examples below with that SHA,
-or use the selected action-prefixed version tag instead.
+The examples below use the latest published action-prefixed version tag.
+For reproducibility and stronger supply-chain security, prefer replacing the
+tag with that release's full commit SHA.
 
 Minimal job configuration; no GitHub API permission is needed:
 
@@ -22,7 +20,7 @@ runs-on: ubuntu-latest
 steps:
   - name: Capture workflow context
     id: context
-    uses: btnguyen2k/gh-actions/workflow-context@<released-commit-sha>
+    uses: btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0
   - name: Use the captured target
     shell: bash
     env:
@@ -40,7 +38,7 @@ permissions:
   pull-requests: read
 steps:
   - id: context
-    uses: btnguyen2k/gh-actions/workflow-context@<released-commit-sha>
+    uses: btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0
     with:
       github-token: ${{ github.token }}
       target-sha: ${{ github.event.pull_request.head.sha || github.sha }}

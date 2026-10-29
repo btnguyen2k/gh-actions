@@ -11,10 +11,10 @@ workflows.
 
 ## Actions
 
-| Action | Benefit |
-| --- | --- |
-| [automerge-dependabot](automerge-dependabot/README.md) | Merge eligible Dependabot PRs after successful CI for their current head, without checking out PR code. |
-| [workflow-context](workflow-context/README.md) | Standardize workflow context and share event, SHA/branch, PR, and run metadata across jobs. |
+| Action | Latest version | Description |
+| --- | --- | --- |
+| [automerge-dependabot](automerge-dependabot/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/automerge-dependabot/v0.1.0) | Merge eligible Dependabot PRs after successful CI for their current head. |
+| [workflow-context](workflow-context/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/workflow-context/v0.1.0) | Standardize workflow context and share event, SHA/branch, PR, and run metadata across jobs. |
 
 See each action's README for inputs, outputs, permissions, and supported runners.
 
