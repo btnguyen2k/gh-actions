@@ -9,6 +9,9 @@
   and `tests/run.sh`. Keep implementation files, dependency manifests, lockfiles,
   and runtime assets within that action's directory. Choose the runtime per action;
   do not impose a repository-wide application framework or package version.
+- Every action or workflow README must include a dedicated `## License` section
+  that explicitly names the MIT License and uses the absolute license URL
+  `https://github.com/btnguyen2k/gh-actions/blob/main/LICENSE.md`.
 - Keep the root README concise and focused on business value, the action catalog,
   and consumer-facing usage. Keep internal development, CI, and release procedures
   in these instructions, not the README.
@@ -32,6 +35,13 @@
 - Avoid runtime dependencies on sibling action directories. If shared source is
   introduced, bundle it into each consumer where appropriate and test/release
   every affected action independently.
+- Repository workflows invoke in-repository actions via `uses: ./<action>`,
+  not published self-references. Check out the intended source commit first.
+  Privileged `workflow_run` jobs use their trusted workflow SHA, never the
+  upstream PR head.
+- Include composite action directories in the `github-actions` update entry in
+  `.github/dependabot.yml` when they reference external actions. The root `/`
+  scan does not cover nested action metadata.
 - Never interpolate untrusted contexts or inputs directly into shell code. Pass
   values through environment variables or arguments and quote them. Do not log
   secrets; use least-privilege tokens and explicit, actionable failures.
@@ -110,13 +120,26 @@
   changelog planning and successful previews, or an intentional preview skip
   (no selected releases, explicit preview disable, or a deleted branch).
   Failures, cancellations, and unexpected skips fail the corresponding marker.
-- Standalone push CI excludes `release/**`; the release workflow owns those
-  pushes. Ordinary branch pushes, pull requests (including those into release
-  branches), and manual CI keep their existing coverage and previews.
+- Standalone push CI excludes `release/**`, owned by the release workflow, and
+  `dependabot/**`, covered by pull-request CI. Avoid duplicate push/PR runs with
+  the same required check names on Dependabot heads: automerge attempts merging
+  after successful PR CI without waiting or retrying. Other branch pushes,
+  pull requests (including those into release branches), and manual/reusable CI
+  keep their existing coverage and previews.
 - Run the same report locally with `python .github\scripts\monorepo.py changelog`;
   set `CHANGELOG_BRANCH` to select a branch scope. If unset, all actions are shown.
   This command prepares release inputs; version calculation and final release
   notes are delegated to action-semrelease in CI, not implemented in Python.
+
+## Pre-release action review
+
+- Use `.github\agents\action-release-reviewer.agent.md` for a review-only check of
+  repository conventions and the selected action's own documented contract.
+- Select `/agent action-release-reviewer`, then request
+  `Review <action-name> before release.` Include a candidate ref or comparison
+  baseline when reviewing something other than the current checkout.
+- The reviewer reports evidence-backed readiness, blockers, and incomplete
+  checks. It does not fix findings, change release artifacts, or publish.
 
 ## Commit messages
 
@@ -151,6 +174,20 @@
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable
   release in their respective lines, never the most recently published by date.
+- New actions start with `# Version: 0.0.0` at the top of `action.yml` and a
+  `0.0.0` version entry in the root README's Actions table. All action READMEs,
+  including `dummy`, use a near-top `**Latest version:**` line linking `vX.Y.Z`
+  to the action's GitHub Release, followed by ``(tag: `<action>/vX.Y.Z`).``.
+  Keep this format for `0.0.0`, even if the tag or release does not exist.
+  Use `0.0.0` when no published stable GitHub Release exists; it is a normal
+  stable version, not an unreleased state. Keep internal `dummy` out of the root
+  catalog. Never add an unsupported top-level `version` metadata key.
+- Release preparation updates the selected action's version comment, README
+  version/release link and applicable full-version tag examples, and its version
+  link in the root README's Actions table to the calculated `<action>/vX.Y.Z`
+  release. Update `dummy`'s own files too, but never add it to the root catalog.
+  Require the version markers and public catalog entry to exist in the incoming
+  source; new-action development must add them before release preparation.
 - Do not create unprefixed repository-wide version tags or bump unaffected
   actions. A tag selects a whole-repository snapshot but releases only the named
   action.
@@ -170,8 +207,11 @@
 - Prepend `## v<version>` and generated notes to `<action>/RELEASE-NOTES.md`,
   preserving the title on line 1 and all older entries. An identical existing
   entry is a no-op; conflicting notes or duplicate version headings fail.
-  The controlled writer changes only this text file to create N. Do not rerun
-  CI or add a separate Git diff-check stage for N. Publish/tag N, not cleanup C.
+  The controlled writer creates N from R, changing only this file, the selected
+  action's version comment in `action.yml`, its README version/tag references,
+  and its root README catalog version (except for `dummy`). Never change runtime
+  implementation files in N. Do not rerun CI or add a separate Git diff-check
+  stage for N. Publish/tag N, not cleanup C.
 - Freeze the validated job-local `release-state.json` plan before publication.
   Keep the version, notes, original merge SHA, current-run/attempt CI evidence,
   commit SHAs, and content digests in that local file only; do not upload/download
@@ -186,11 +226,13 @@
   while promotion is pending, provided earlier publication and cleanup completed.
   Verify prior notes/cleanup bookkeeping against the immutable full-version tag
   and published stable GitHub Release, not promotion PR bodies or main ancestry.
-  When notes are unchanged, use the tag's verified release-PR merge to detect
-  missing cleanup even though there is no generated notes commit.
+  Track generated version-metadata commits even when notes are unchanged. When
+  notes and version metadata are all unchanged, use the tag's verified release-PR
+  merge to detect missing cleanup even though there is no generated commit.
   Incomplete or conflicting publication/cleanup still requires manual reconciliation.
 - Keep one open promotion PR per action into the default branch. Create it when
-  none is open; otherwise reuse it, update its title, and append the new release's
+  none is open; otherwise reuse it, update its title to
+  `Promote release/<action> to <default-branch>`, and append the new release's
   information without replacing existing description text. The PR's source branch
   and cumulative diff advance with each release. Closed or merged PRs do not
   block a new one; ambiguous multiple open matches fail explicitly.
@@ -227,8 +269,9 @@
   promotion descriptions are optional and never determine release eligibility.
 - Configure repository rulesets to prevent full-version tag updates/deletions
   while allowing major/minor alias updates. Consider immutable GitHub releases;
-  never attach GitHub releases to moving aliases or mark an action release as
-  the repository-wide "latest" release.
+  never attach GitHub releases to moving aliases. Publish internal `dummy`
+  releases with `make_latest: "false"` and all other action releases with
+  `make_latest: "true"`. The Latest designation is repository-wide, not per action.
 - Keep workflow permissions read-only by default. Only `Release` and the
   Dependabot auto-merge job grant `GITHUB_TOKEN` contents/pull-request write.
   `Release` additionally retains actions read access for current-attempt CI
@@ -244,6 +287,9 @@
   metadata, compare its head with `workflow_run.head_sha`, and pass the same SHA
   to the merge API. Skip stale/ineligible PRs and surface API/merge failures.
   Never bypass branch rules or auto-merge release-promotion PRs.
+- The reusable `automerge-dependabot` action independently enforces these event
+  and merge guards, returning `status`, `reason`, and `pr-number` for caller-owned
+  presentation. Keep the action itself checkout-free and self-contained.
 - Update the relevant action README and root catalog when adding an action or
   changing its API. See the root README for usage and Marketplace limitations.
 

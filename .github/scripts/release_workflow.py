@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
@@ -38,6 +38,13 @@ def git(root: Path, *arguments: str, stdin: bytes | None = None, env=None) -> st
 
 def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def release_paths(action: str) -> list[str]:
+    paths = [f"{action}/RELEASE-NOTES.md", f"{action}/action.yml", f"{action}/README.md"]
+    if action != "dummy":
+        paths.append("README.md")
+    return paths
 
 
 def positive_integer(value: str) -> int:
@@ -112,21 +119,23 @@ class Plan:
     ci_run_attempt: int
     ci_target_sha: str
     release_sha: str = ""
-    history_digest: str = ""
+    release_digests: dict[str, str] = field(default_factory=dict)
     cleanup_sha: str = ""
-    schema: int = 1
+    schema: int = 2
 
     def validate(self) -> None:
         self.cycle.validate()
-        if type(self.schema) is not int or self.schema != 1:
+        if type(self.schema) is not int or self.schema != 2:
             raise ValueError("Unsupported release plan schema.")
         for name in (
             "stage", "version", "requested_version", "change_log", "release_notes",
             "timestamp", "changelog_digest", "section_digest", "ci_target_sha",
-            "release_sha", "history_digest", "cleanup_sha",
+            "release_sha", "cleanup_sha",
         ):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"Invalid release plan field: {name}.")
+        if not isinstance(self.release_digests, dict):
+            raise ValueError("Invalid release file digests.")
         if self.stage not in ("calculated", "prepared", "frozen"):
             raise ValueError("Invalid release plan stage.")
         monorepo.parse_version(self.version)
@@ -152,9 +161,12 @@ class Plan:
         if self.stage != "calculated":
             if not SHA.fullmatch(self.release_sha) or not SHA.fullmatch(self.cleanup_sha):
                 raise ValueError("Prepared plans require release and cleanup SHAs.")
-            if not DIGEST.fullmatch(self.history_digest):
-                raise ValueError("Prepared plans require a release-notes digest.")
-        elif self.release_sha or self.cleanup_sha or self.history_digest:
+            if set(self.release_digests) != set(release_paths(self.cycle.action)) or any(
+                not isinstance(value, str) or not DIGEST.fullmatch(value)
+                for value in self.release_digests.values()
+            ):
+                raise ValueError("Prepared plans require digests for every controlled release file.")
+        elif self.release_sha or self.cleanup_sha or self.release_digests:
             raise ValueError("Calculated plans must not claim prepared commits.")
 
     @classmethod
@@ -341,7 +353,7 @@ def verify_previous_releases(root: Path, client: GitHub, cycle: Cycle, tags: dic
     cleanups: dict[str, tuple[str, str]] = {}
     messages = git(
         root, "log", "--full-history", "--format=%H%x00%B%x00", cycle.merge_sha, "--",
-        f"{cycle.action}/RELEASE-NOTES.md", ".semrelease/this_release",
+        *release_paths(cycle.action), ".semrelease/this_release",
     ).split("\0")
     for commit, message in zip(messages[::2], messages[1::2]):
         for label, subject, records in (
@@ -566,7 +578,51 @@ def prepend_history(content: bytes, version: str, notes: str) -> bytes:
     return b"\xef\xbb\xbf" + updated if content.startswith(b"\xef\xbb\xbf") else updated
 
 
-def commit_file(root: Path, parent: str, filename: str, content: bytes, timestamp: str, message: str) -> str:
+def release_contents(root: Path, plan: Plan) -> dict[str, bytes]:
+    action = plan.cycle.action
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    url = f"{server}/{plan.cycle.repository}/releases/tag/{plan.tag}"
+    contents = {}
+    for filename in release_paths(action):
+        entry = git(root, "ls-tree", plan.cycle.merge_sha, "--", filename).split()
+        if not entry or entry[0] != "100644":
+            raise ValueError(f"{filename} must be a regular, non-executable tracked file.")
+        original = run(root, "git", "show", f"{plan.cycle.merge_sha}:{filename}")
+        if filename == f"{action}/RELEASE-NOTES.md":
+            contents[filename] = prepend_history(original, plan.version, plan.release_notes)
+            continue
+        text = original.decode("utf-8")
+        if filename == f"{action}/action.yml":
+            pattern = rf"\A(?P<prefix>\ufeff?# Version: ){monorepo.VERSION.pattern}(?=\r?\n)"
+            replacement = plan.version
+            marker = "top-of-file # Version: X.Y.Z comment"
+        elif filename == f"{action}/README.md":
+            pattern = r"^(?P<prefix>\*\*(?:Latest version|Version):\*\*)[^\r\n]*"
+            replacement = f" [v{plan.version}]({url})"
+            marker = "Version or Latest version line"
+        else:
+            pattern = (
+                rf"^(?P<prefix>\|[ \t]*\[{re.escape(action)}\]"
+                rf"\({re.escape(action)}/README\.md\)[ \t]*\|)[^|\r\n]*(?=\|)"
+            )
+            replacement = f" [v{plan.version}]({url}) "
+            marker = f"Actions table entry for {action}"
+        text, count = re.subn(
+            pattern, lambda match: match["prefix"] + replacement, text, flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise ValueError(f"{filename} must contain exactly one {marker}.")
+        if filename == f"{action}/README.md":
+            text = re.sub(
+                rf"(?P<prefix>(?<![A-Za-z0-9_-]){re.escape(action)}/v)"
+                rf"{monorepo.VERSION.pattern}(?![0-9A-Za-z.+-])",
+                lambda match: match["prefix"] + plan.version, text,
+            )
+        contents[filename] = text.encode("utf-8")
+    return contents
+
+
+def commit_files(root: Path, parent: str, contents: dict[str, bytes], timestamp: str, message: str) -> str:
     with tempfile.TemporaryDirectory(prefix="release-index-") as temporary:
         env = {
             **os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index"),
@@ -575,8 +631,9 @@ def commit_file(root: Path, parent: str, filename: str, content: bytes, timestam
             "GIT_AUTHOR_DATE": timestamp, "GIT_COMMITTER_DATE": timestamp,
         }
         git(root, "read-tree", parent, env=env)
-        blob = git(root, "hash-object", "-w", "--stdin", stdin=content, env=env)
-        git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{filename}", env=env)
+        for filename, content in contents.items():
+            blob = git(root, "hash-object", "-w", "--stdin", stdin=content, env=env)
+            git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{filename}", env=env)
         tree = git(root, "write-tree", env=env)
         if tree == git(root, "rev-parse", f"{parent}^{{tree}}"):
             return parent
@@ -587,20 +644,19 @@ def commit_file(root: Path, parent: str, filename: str, content: bytes, timestam
         )
 
 
+def commit_file(root: Path, parent: str, filename: str, content: bytes, timestamp: str, message: str) -> str:
+    return commit_files(root, parent, {filename: content}, timestamp, message)
+
+
 def prepare(root: Path, _client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
     if plan.stage != "calculated":
         raise ValueError("Preparation requires a new calculation; reconcile repeated preparation manually.")
     require_unstarted(root, plan.cycle)
     cleaned = check_source(root, plan)
-    filename = f"{plan.cycle.action}/RELEASE-NOTES.md"
-    entry = git(root, "ls-tree", plan.cycle.merge_sha, "--", filename).split()
-    if not entry or entry[0] != "100644":
-        raise ValueError("RELEASE-NOTES.md must be a regular, non-executable tracked file.")
-    original = run(root, "git", "show", f"{plan.cycle.merge_sha}:{filename}")
-    updated = prepend_history(original, plan.version, plan.release_notes)
-    release_sha = commit_file(
-        root, plan.cycle.merge_sha, filename, updated, plan.timestamp,
+    contents = release_contents(root, plan)
+    release_sha = commit_files(
+        root, plan.cycle.merge_sha, contents, plan.timestamp,
         f"docs(action): record release notes\n\n"
         f"Action-Release: {plan.cycle.action}@{plan.cycle.merge_sha}\nRelease: {plan.tag}\n",
     )
@@ -611,7 +667,8 @@ def prepare(root: Path, _client: GitHub, path: Path) -> None:
     )
     prepared = replace(
         plan, stage="prepared", release_sha=release_sha,
-        history_digest=digest(updated), cleanup_sha=cleanup_sha,
+        release_digests={filename: digest(content) for filename, content in contents.items()},
+        cleanup_sha=cleanup_sha,
     )
     save(path, prepared)
     print(f"✅ Prepared {plan.tag}: merge {plan.cycle.merge_sha}, release {release_sha}.")
@@ -669,7 +726,7 @@ def push_branch(root: Path, branch: str, expected: str, target: str) -> None:
 def push_notes(root: Path, client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
     if plan.stage != "prepared":
-        raise ValueError("Release notes must be prepared before pushing.")
+        raise ValueError("Release metadata and notes must be prepared before pushing.")
     require_unstarted(root, plan.cycle)
     require_new_release(root, client, plan)
     if plan.release_sha != plan.cycle.merge_sha:
@@ -679,12 +736,13 @@ def push_notes(root: Path, client: GitHub, path: Path) -> None:
 def freeze(root: Path, client: GitHub, path: Path) -> None:
     plan = load(path, Cycle.environment())
     if plan.stage != "prepared":
-        raise ValueError("Cannot freeze before release-notes preparation.")
+        raise ValueError("Cannot freeze before release metadata and notes are prepared.")
     verify_ci(client, plan)
     fetch(root, plan.release_sha)
-    content = run(root, "git", "show", f"{plan.release_sha}:{plan.cycle.action}/RELEASE-NOTES.md")
-    if digest(content) != plan.history_digest:
-        raise ValueError("Committed release notes do not match the prepared plan.")
+    for filename, expected in plan.release_digests.items():
+        content = run(root, "git", "show", f"{plan.release_sha}:{filename}")
+        if digest(content) != expected:
+            raise ValueError(f"Committed {filename} does not match the prepared release plan.")
     if remote_head(root, plan.cycle.branch) != plan.release_sha:
         raise ValueError("Release branch advanced before the plan could be frozen.")
     save(path, replace(plan, stage="frozen"))
@@ -710,7 +768,8 @@ def publish(root: Path, client: GitHub, path: Path) -> None:
     monorepo.push_tags(root, targets, objects, plan.tag)
     existing = client.api(f"repos/{plan.cycle.repository}/releases", "POST", {
         "tag_name": plan.tag, "target_commitish": plan.release_sha, "name": plan.tag,
-        "body": plan.release_notes, "draft": False, "prerelease": False, "make_latest": "false",
+        "body": plan.release_notes, "draft": False, "prerelease": False,
+        "make_latest": "false" if plan.cycle.action == "dummy" else "true",
     })
     print(f"✅ Release: {existing['html_url']}")
 
@@ -739,7 +798,7 @@ def promote(root: Path, client: GitHub, path: Path) -> None:
     pr = prs[0] if prs else None
     if pr is not None and pr["head"]["sha"] != plan.cleanup_sha:
         raise ValueError("The open promotion PR does not point to the recorded cleanup commit.")
-    title = f"Promote {plan.cycle.action} to {plan.cycle.default_branch}"
+    title = f"Promote {plan.cycle.branch} to {plan.cycle.default_branch}"
     body = (pr["body"] or "") if pr is not None else (
         f"Promotes all unmerged changes from `{plan.cycle.branch}` "
         f"to `{plan.cycle.default_branch}`, including the releases below."

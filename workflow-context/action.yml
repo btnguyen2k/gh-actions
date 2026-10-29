@@ -1,3 +1,4 @@
+# Version: 0.1.0
 name: Workflow Context
 description: Capture event, target, pull request, and workflow-run metadata as outputs.
 

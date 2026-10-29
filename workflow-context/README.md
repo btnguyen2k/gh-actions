@@ -1,10 +1,17 @@
 # workflow-context
 
+**Latest version:** [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/workflow-context/v0.1.0)
+(tag: `workflow-context/v0.1.0`).
+
 Capture the workflow trigger, target SHA/branch, pull request details, and run
 metadata as action outputs. No checkout is required. The action uses JavaScript
 on Node.js 24 with no external dependencies or build step.
 
 ## Usage
+
+The examples below use the latest published action-prefixed version tag.
+For reproducibility and stronger supply-chain security, prefer replacing the
+tag with that release's full commit SHA.
 
 Minimal job configuration; no GitHub API permission is needed:
 
@@ -13,7 +20,7 @@ runs-on: ubuntu-latest
 steps:
   - name: Capture workflow context
     id: context
-    uses: btnguyen2k/gh-actions/workflow-context@<released-commit-sha>
+    uses: btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0
   - name: Use the captured target
     shell: bash
     env:
@@ -31,7 +38,7 @@ permissions:
   pull-requests: read
 steps:
   - id: context
-    uses: btnguyen2k/gh-actions/workflow-context@<released-commit-sha>
+    uses: btnguyen2k/gh-actions/workflow-context@workflow-context/v0.1.0
     with:
       github-token: ${{ github.token }}
       target-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -172,4 +179,6 @@ tests through Bash. The shipped JavaScript is the runtime artifact; no compilati
 or bundling is needed. Action versions come from `workflow-context/vX.Y.Z` tags;
 this private package is not published to npm.
 
-Licensed under the repository's [MIT license](../LICENSE.md).
+## License
+
+This action is licensed under the [MIT License](https://github.com/btnguyen2k/gh-actions/blob/main/LICENSE.md).

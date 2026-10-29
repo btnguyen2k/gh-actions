@@ -1,6 +1,6 @@
-[![Release](https://img.shields.io/github/release/btnguyen2k/gh-actions.svg?style=flat-square)](RELEASE-NOTES.md)
-[![Actions Status](https://github.com/btnguyen2k/gh-actions/workflows/CI/badge.svg)](https://github.com/btnguyen2k/gh-actions/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE.md)
+[![Actions Status](https://github.com/btnguyen2k/gh-actions/workflows/CI/badge.svg)](https://github.com/btnguyen2k/gh-actions/actions)
+[![Release](https://img.shields.io/github/release/btnguyen2k/gh-actions.svg?style=flat-square)](https://github.com/btnguyen2k/gh-actions/releases)
 
 Reusable GitHub actions to reduce repetitive workflow scripting and standardize
 automation across repositories.
@@ -11,9 +11,10 @@ workflows.
 
 ## Actions
 
-| Action | Benefit |
-| --- | --- |
-| [workflow-context](workflow-context/README.md) | Standardize workflow context and share event, SHA/branch, PR, and run metadata across jobs. |
+| Action | Latest version | Description |
+| --- | --- | --- |
+| [automerge-dependabot](automerge-dependabot/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/automerge-dependabot/v0.1.0) | Merge eligible Dependabot PRs after successful CI for their current head. |
+| [workflow-context](workflow-context/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/workflow-context/v0.1.0) | Standardize workflow context and share event, SHA/branch, PR, and run metadata across jobs. |
 
 See each action's README for inputs, outputs, permissions, and supported runners.
 
