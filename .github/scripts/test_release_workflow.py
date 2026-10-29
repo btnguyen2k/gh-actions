@@ -612,25 +612,53 @@ class ContextTests(ReleaseFixture):
             release.context(self.root, self.client, self.path)
         self.assertFalse(self.client.writes)
 
-    def test_prior_cleanup_without_a_published_release_blocks_another_cycle(self):
+    def test_prior_cleanup_without_a_published_release_warns_and_allows_another_cycle(self):
         first = self.complete_release(promote=False)
         del self.client.releases[first.tag]
         self.start_cycle(first.cleanup_sha)
-        with self.assertRaisesRegex(ValueError, "Publication.*must complete"):
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
             release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing GitHub Release", output.getvalue())
         self.assertEqual(len(self.client.writes), 1)
 
-    def test_prior_cleanup_with_a_missing_or_moved_full_tag_blocks_another_cycle(self):
+    def test_missing_historical_tag_warns_but_moved_tag_still_blocks_another_cycle(self):
         first = self.complete_release(promote=False)
         self.start_cycle(first.cleanup_sha)
         release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{first.tag}")
-        with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
             release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing immutable tag", output.getvalue())
         release.git(
             self.root, "push", "--quiet", "origin", f"{first.cycle.merge_sha}:refs/tags/{first.tag}",
         )
+        del self.client.releases[first.tag]
         with self.assertRaisesRegex(ValueError, "immutable tag does not match"):
             release.context(self.root, self.client, self.path)
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_missing_historical_release_and_tag_warn_and_allow_another_cycle(self):
+        first = self.complete_release(promote=False)
+        del self.client.releases[first.tag]
+        release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{first.tag}")
+        self.start_cycle(first.cleanup_sha)
+        with patch("release_workflow.emit") as emit, patch("sys.stdout", new_callable=io.StringIO) as output:
+            release.context(self.root, self.client, self.path)
+        self.assertTrue(emit.call_args.kwargs["eligible"])
+        self.assertIn(f"::warning::⚠️ Historical publication of {first.tag}", output.getvalue())
+        self.assertIn("missing GitHub Release and immutable tag", output.getvalue())
+        self.assertEqual(len(self.client.writes), 1)
+
+    def test_historical_release_lookup_errors_remain_fatal(self):
+        first = self.complete_release(promote=False)
+        self.start_cycle(first.cleanup_sha)
+        error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"gh: Forbidden (HTTP 403)")
+        with patch.object(self.client, "optional", side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.context(self.root, self.client, self.path)
         self.assertEqual(len(self.client.writes), 1)
 
     def test_prior_draft_or_prerelease_is_not_completed_publication(self):
@@ -1070,9 +1098,20 @@ class ReleaseIntegrationTests(ReleaseFixture):
 
     def test_missing_publication_cannot_remove_staged_notes(self):
         plan = self.freeze()
-        with self.assertRaisesRegex(ValueError, "Publication"):
-            release.cleanup(self.root, self.client, self.path)
+        for command in (release.cleanup, release.promote):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(ValueError, "Publication"):
+                command(self.root, self.client, self.path)
         self.assertEqual(release.remote_head(self.root, self.cycle.branch), plan.release_sha)
+
+    def test_missing_current_tag_blocks_cleanup_and_promotion(self):
+        plan = self.freeze()
+        release.publish(self.root, self.client, self.path)
+        release.git(self.root, "push", "--quiet", "origin", f":refs/tags/{plan.tag}")
+        for command in (release.cleanup, release.promote):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(ValueError, "immutable tag"):
+                command(self.root, self.client, self.path)
+        self.assertEqual(release.remote_head(self.root, self.cycle.branch), plan.release_sha)
+        self.assertEqual(len(self.client.writes), 1)
 
     def test_conflicting_github_release_is_never_overwritten(self):
         plan = self.freeze()
