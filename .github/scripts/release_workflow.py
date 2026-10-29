@@ -406,7 +406,7 @@ def verify_previous_releases(root: Path, client: GitHub, cycle: Cycle, tags: dic
             raise ValueError(
                 f"Previous release {tag} has unrelated cleanup; reconcile it manually."
             )
-        require_published(root, client, tag, release_sha)
+        require_published(root, client, tag, release_sha, allow_missing=True)
 
 
 def context(root: Path, client: GitHub, _path: Path) -> None:
@@ -706,14 +706,27 @@ def require_new_release(root: Path, client: GitHub, plan: Plan) -> None:
 
 def require_published(
     root: Path, client: GitHub, tag: str, release_sha: str, notes: str | None = None,
+    *, allow_missing: bool = False,
 ) -> None:
+    missing = []
     if release_record(client, tag, notes) is None:
-        raise ValueError(f"Publication of {tag} must complete before cleanup, promotion, or another cycle.")
+        if not allow_missing:
+            raise ValueError(f"Publication of {tag} must complete before cleanup, promotion, or another cycle.")
+        missing.append("GitHub Release")
     reference = f"refs/tags/{tag}"
     refs = git(root, "ls-remote", "--tags", "origin", reference, reference + "^{}")
     objects = dict(line.split()[::-1] for line in refs.splitlines())
-    if objects.get(reference + "^{}", objects.get(reference)) != release_sha:
+    published_sha = objects.get(reference + "^{}", objects.get(reference))
+    if published_sha is None and allow_missing:
+        missing.append("immutable tag")
+    elif published_sha != release_sha:
         raise ValueError("The published immutable tag does not match release N.")
+    if missing:
+        print(
+            f"::warning::⚠️ Historical publication of {tag} is missing "
+            f"{' and '.join(missing)}; cleanup is recorded, so continuing.",
+            flush=True,
+        )
 
 
 def push_branch(root: Path, branch: str, expected: str, target: str) -> None:

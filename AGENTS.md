@@ -229,7 +229,11 @@
   Track generated version-metadata commits even when notes are unchanged. When
   notes and version metadata are all unchanged, use the tag's verified release-PR
   merge to detect missing cleanup even though there is no generated commit.
-  Incomplete or conflicting publication/cleanup still requires manual reconciliation.
+  Once matching cleanup is recorded, missing historical GitHub Releases or
+  immutable tags are warnings, including for `dummy`. Conflicting records/tag
+  targets and incomplete or unrelated cleanup remain fatal and require manual
+  reconciliation. Current-cycle publication checks remain mandatory before
+  cleanup or promotion.
 - Keep one open promotion PR per action into the default branch. Create it when
   none is open; otherwise reuse it, update its title to
   `Promote release/<action> to <default-branch>`, and append the new release's
