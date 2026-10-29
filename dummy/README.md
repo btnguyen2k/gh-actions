@@ -1,7 +1,7 @@
 # dummy
 
-**Latest version:** [v0.0.0](https://github.com/btnguyen2k/gh-actions/releases/tag/dummy/v0.0.0)
-(tag: `dummy/v0.0.0`).
+**Latest version:** [v0.2.1](https://github.com/btnguyen2k/gh-actions/releases/tag/dummy/v0.2.1)
+(tag: `dummy/v0.2.1`).
 
 Internal action for testing this repository's CI and release flow. It initializes
 `touch` to `2` and prints `touch=2` alongside the testing-only message. It performs

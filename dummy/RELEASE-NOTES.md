@@ -1,5 +1,11 @@
 # Release Notes - dummy
 
+## v0.2.1
+
+### Fixed/Improvements
+
+- Fix(action): bump touch to 2
+
 ## v0.2.0
 
 ### Added/Refactoring/Deprecation

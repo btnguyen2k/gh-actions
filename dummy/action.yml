@@ -1,4 +1,4 @@
-# Version: 0.0.0
+# Version: 0.2.1
 name: Dummy
 description: Internal testing-only action that prints a message and performs no meaningful work.
 runs:
