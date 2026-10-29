@@ -7,3 +7,5 @@
 # Follow each header line with the list of changes for that release.
 # touch = 1
 
+#!dummy/v0.2.1
+- fix(action): bump touch to 2

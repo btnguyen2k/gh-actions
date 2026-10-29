@@ -125,9 +125,9 @@ jobs:
           CI_RUN_ATTEMPT: ${{ github.run_attempt }}
           CI_TARGET_SHA: ${{ needs.CI.outputs.target-sha }}
         run: python .github/scripts/release_workflow.py calculate
-      - name: Prepare the notes-only and cleanup commits
+      - name: Prepare release metadata, notes, and cleanup commits
         run: python .github/scripts/release_workflow.py prepare
-      - name: Commit the release-notes update
+      - name: Commit release metadata and notes
         run: python .github/scripts/release_workflow.py push-notes
       - name: Freeze release plan
         run: python .github/scripts/release_workflow.py freeze

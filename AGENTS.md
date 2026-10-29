@@ -174,16 +174,20 @@
   `<action-name>/vX.Y.Z`; they are immutable and must never be moved or reused.
   Moving `<action-name>/vX` and `<action-name>/vX.Y` aliases track the highest stable
   release in their respective lines, never the most recently published by date.
-- After every public action release, refresh its `# Version: X.Y.Z` comment at
-  the top of `<action>/action.yml`, the short latest-version/tag line near the top
-  of `<action>/README.md`, all applicable usage examples, and its latest-version
-  release link in the root README's Actions table. Use the latest published
-  stable `<action>/vX.Y.Z` tag; never add an unsupported top-level `version` key.
-  Exclude the internal `dummy` action. Keep these follow-up source/documentation
-  updates outside the controlled release-notes-only writer.
-- If an action has no published stable GitHub Release, use `0.0.0` in its version
-  comment and README version line. Label it as unreleased and do not link to or
-  use nonexistent release tags in examples.
+- New actions start with `# Version: 0.0.0` at the top of `action.yml` and a
+  `0.0.0` version entry in the root README's Actions table. All action READMEs,
+  including `dummy`, use a near-top `**Latest version:**` line linking `vX.Y.Z`
+  to the action's GitHub Release, followed by ``(tag: `<action>/vX.Y.Z`).``.
+  Keep this format for `0.0.0`, even if the tag or release does not exist.
+  Use `0.0.0` when no published stable GitHub Release exists; it is a normal
+  stable version, not an unreleased state. Keep internal `dummy` out of the root
+  catalog. Never add an unsupported top-level `version` metadata key.
+- Release preparation updates the selected action's version comment, README
+  version/release link and applicable full-version tag examples, and its version
+  link in the root README's Actions table to the calculated `<action>/vX.Y.Z`
+  release. Update `dummy`'s own files too, but never add it to the root catalog.
+  Require the version markers and public catalog entry to exist in the incoming
+  source; new-action development must add them before release preparation.
 - Do not create unprefixed repository-wide version tags or bump unaffected
   actions. A tag selects a whole-repository snapshot but releases only the named
   action.
@@ -203,8 +207,11 @@
 - Prepend `## v<version>` and generated notes to `<action>/RELEASE-NOTES.md`,
   preserving the title on line 1 and all older entries. An identical existing
   entry is a no-op; conflicting notes or duplicate version headings fail.
-  The controlled writer changes only this text file to create N. Do not rerun
-  CI or add a separate Git diff-check stage for N. Publish/tag N, not cleanup C.
+  The controlled writer creates N from R, changing only this file, the selected
+  action's version comment in `action.yml`, its README version/tag references,
+  and its root README catalog version (except for `dummy`). Never change runtime
+  implementation files in N. Do not rerun CI or add a separate Git diff-check
+  stage for N. Publish/tag N, not cleanup C.
 - Freeze the validated job-local `release-state.json` plan before publication.
   Keep the version, notes, original merge SHA, current-run/attempt CI evidence,
   commit SHAs, and content digests in that local file only; do not upload/download
@@ -219,8 +226,9 @@
   while promotion is pending, provided earlier publication and cleanup completed.
   Verify prior notes/cleanup bookkeeping against the immutable full-version tag
   and published stable GitHub Release, not promotion PR bodies or main ancestry.
-  When notes are unchanged, use the tag's verified release-PR merge to detect
-  missing cleanup even though there is no generated notes commit.
+  Track generated version-metadata commits even when notes are unchanged. When
+  notes and version metadata are all unchanged, use the tag's verified release-PR
+  merge to detect missing cleanup even though there is no generated commit.
   Incomplete or conflicting publication/cleanup still requires manual reconciliation.
 - Keep one open promotion PR per action into the default branch. Create it when
   none is open; otherwise reuse it, update its title to
