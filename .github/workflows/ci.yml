@@ -193,7 +193,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
@@ -220,6 +220,16 @@ jobs:
         run: python -m unittest discover --start-directory .github/scripts --pattern "test_*.py"
       - name: Test actions
         run: python .github/scripts/monorepo.py test
+      - name: Build native Docker images without publishing
+        if: ${{ runner.os == 'Linux' || runner.os == 'Windows' }}
+        uses: ./dockerbp
+        with:
+          image: dockerbp-ci/build
+          target-sha: ${{ needs.CaptureContext.outputs.target-sha }}
+          platforms: ${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}
+          context: dockerbp/tests/fixtures
+          dockerfile: ${{ runner.os == 'Windows' && 'Dockerfile.windows' || 'Dockerfile' }}
+          publish: false
       - name: Check tracked generated files
         run: git diff --exit-code HEAD --
 

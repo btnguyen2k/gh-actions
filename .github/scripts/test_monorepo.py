@@ -1339,6 +1339,24 @@ class CIWorkflowTestCase(unittest.TestCase):
         )
 
 
+class DockerBPWorkflowTests(CIWorkflowTestCase):
+    def test_native_build_checks_use_the_validation_sha_without_registry_writes(self):
+        steps = self.jobs["Validate"]["steps"]
+        build = next(step for step in steps if step.get("uses") == "./dockerbp")
+        self.assertEqual(build["if"], "${{ runner.os == 'Linux' || runner.os == 'Windows' }}")
+        self.assertEqual(build["with"]["target-sha"], "${{ needs.CaptureContext.outputs.target-sha }}")
+        self.assertIs(build["with"]["publish"], False)
+        self.assertEqual(build["with"]["platforms"], (
+            "${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}"
+        ))
+        self.assertEqual(build["with"]["dockerfile"], (
+            "${{ runner.os == 'Windows' && 'Dockerfile.windows' || 'Dockerfile' }}"
+        ))
+        self.assertNotIn("continue-on-error", build)
+        self.assertEqual(self.jobs["ValidatePass"]["needs"], "Validate")
+        self.assertLess(steps.index(build), len(steps) - 1)
+
+
 class CIContextWorkflowTests(CIWorkflowTestCase):
     def setUp(self):
         super().setUp()
