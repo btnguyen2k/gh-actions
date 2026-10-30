@@ -17,8 +17,7 @@ inputs:
     default: linux/amd64
   publish:
     description: Publish to Docker Hub instead of building only. Merge mode requires true.
-    type: boolean
-    default: false
+    default: "false"
   dockerfile:
     description: Dockerfile path relative to the build context.
     default: Dockerfile
