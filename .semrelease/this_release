@@ -7,3 +7,5 @@
 # Follow each header line with the list of changes for that release.
 # touch = 1
 
+#!dockerbp/v0.1.0
+- feat(action): build and publish multi-platform Docker images

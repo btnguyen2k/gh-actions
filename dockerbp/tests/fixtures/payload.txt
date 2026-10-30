@@ -1,0 +1,1 @@
+dockerbp native build smoke test

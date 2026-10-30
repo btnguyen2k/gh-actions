@@ -1,0 +1,4 @@
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2025
+USER ContainerAdministrator
+RUN ver > C:\version.txt
+COPY payload.txt C:/payload.txt
