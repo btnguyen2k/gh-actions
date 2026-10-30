@@ -1,0 +1,107 @@
+# Version: 0.1.0
+name: Docker Build and Publish
+description: Build Linux or Windows images and combine distributed builds into Docker Hub tags.
+
+inputs:
+  image:
+    description: Docker Hub image name, such as namespace/repository.
+    required: true
+  target-sha:
+    description: Full source commit SHA; defaults to github.sha.
+    default: ${{ github.sha }}
+  tags:
+    description: Comma-separated or multiline bare tags; defaults to latest. The full SHA tag is always included.
+    default: latest
+  platforms:
+    description: Comma-separated or multiline platforms to build (e.g. linux/amd64, linux/arm64), or the complete expected set in merge mode.
+    default: linux/amd64
+  publish:
+    description: Publish to Docker Hub instead of building only. Merge mode requires true.
+    default: "false"
+  dockerfile:
+    description: Dockerfile path relative to the build context.
+    default: Dockerfile
+  context:
+    description: Build context relative to the pinned source checkout.
+    default: ./
+  mode:
+    description: build for one job, build-shard for distributed builds, or merge to publish their combined manifest.
+    default: build
+  build-records:
+    description: JSON result file or directory of downloaded result files; required in merge mode.
+    default: ""
+
+outputs:
+  status:
+    description: built, shard-published, or published.
+    value: ${{ steps.execute.outputs.status }}
+  image:
+    description: Canonical Docker Hub image name.
+    value: ${{ steps.execute.outputs.image }}
+  target-sha:
+    description: Full pinned source commit SHA.
+    value: ${{ steps.execute.outputs.target-sha }}
+  tags:
+    description: Newline-separated final image references, including the full SHA tag. Not applied by build-shard.
+    value: ${{ steps.execute.outputs.tags }}
+  digest:
+    description: Published manifest digest; empty for build-only runs. A shard returns its own digest.
+    value: ${{ steps.execute.outputs.digest }}
+  record-file:
+    description: Absolute path to a JSON build result for artifact transfer; empty in merge mode.
+    value: ${{ steps.execute.outputs.record-file }}
+  staging-tags:
+    description: Newline-separated temporary registry references retained for caller-managed retention.
+    value: ${{ steps.execute.outputs.staging-tags }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate build inputs
+      id: prepare
+      shell: bash
+      env:
+        DOCKERBP_IMAGE: ${{ inputs.image }}
+        DOCKERBP_TARGET_SHA: ${{ inputs.target-sha }}
+        DOCKERBP_TAGS: ${{ inputs.tags }}
+        DOCKERBP_PLATFORMS: ${{ inputs.platforms }}
+        DOCKERBP_PUBLISH: ${{ inputs.publish }}
+        DOCKERBP_DOCKERFILE: ${{ inputs.dockerfile }}
+        DOCKERBP_CONTEXT: ${{ inputs.context }}
+        DOCKERBP_MODE: ${{ inputs.mode }}
+        DOCKERBP_BUILD_RECORDS: ${{ inputs.build-records }}
+      run: node "$GITHUB_ACTION_PATH/main.cjs" prepare
+    - name: Checkout pinned source
+      if: ${{ steps.prepare.outputs.backend != 'merge' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ github.repository }}
+        ref: ${{ steps.prepare.outputs.target-sha }}
+        path: ${{ steps.prepare.outputs.checkout-path }}
+        persist-credentials: false
+    - name: Verify pinned source and build paths
+      if: ${{ steps.prepare.outputs.backend != 'merge' }}
+      shell: bash
+      env:
+        DOCKERBP_CONFIGURATION: ${{ steps.prepare.outputs.configuration }}
+      run: node "$GITHUB_ACTION_PATH/main.cjs" verify-source
+    - name: Set up Linux emulation
+      if: ${{ steps.prepare.outputs.backend == 'linux' && steps.prepare.outputs.qemu-platforms != '' }}
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      with:
+        platforms: ${{ steps.prepare.outputs.qemu-platforms }}
+    - name: Set up Linux Buildx
+      if: ${{ steps.prepare.outputs.backend == 'linux' }}
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Build or merge images
+      id: execute
+      shell: bash
+      env:
+        DOCKERBP_CONFIGURATION: ${{ steps.prepare.outputs.configuration }}
+      run: node "$GITHUB_ACTION_PATH/main.cjs" run
+    - name: Remove private checkout and temporary configuration
+      if: ${{ always() && steps.prepare.outputs.configuration != '' }}
+      shell: bash
+      env:
+        DOCKERBP_CONFIGURATION: ${{ steps.prepare.outputs.configuration }}
+      run: node "$GITHUB_ACTION_PATH/main.cjs" cleanup
