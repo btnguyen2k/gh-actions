@@ -220,6 +220,12 @@ jobs:
         run: python -m unittest discover --start-directory .github/scripts --pattern "test_*.py"
       - name: Test actions
         run: python .github/scripts/monorepo.py test
+      - name: Set up Docker for native image checks
+        if: ${{ runner.os == 'Linux' || runner.os == 'Windows' }}
+        uses: docker/setup-docker-action@7ec28a010822b4626af4874f9448a4b05ac6f3e5 # v5
+        with:
+          version: v29.7.2
+          daemon-config: ${{ runner.os == 'Linux' && '{"features":{"containerd-snapshotter":true}}' || '{}' }}
       - name: Build native Docker images without publishing
         if: ${{ runner.os == 'Linux' || runner.os == 'Windows' }}
         uses: ./dockerbp
@@ -230,6 +236,42 @@ jobs:
           context: dockerbp/tests/fixtures
           dockerfile: ${{ runner.os == 'Windows' && 'Dockerfile.windows' || 'Dockerfile' }}
           publish: false
+      - name: Build and retain tagged native Docker images
+        id: local-image
+        if: ${{ runner.os == 'Linux' || runner.os == 'Windows' }}
+        uses: ./dockerbp
+        with:
+          image: dockerbp-ci/local
+          target-sha: ${{ needs.CaptureContext.outputs.target-sha }}
+          platforms: ${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}
+          context: dockerbp/tests/fixtures
+          dockerfile: ${{ runner.os == 'Windows' && 'Dockerfile.windows' || 'Dockerfile' }}
+          tags: local-smoke
+          publish: local
+      - name: Check retained local Docker images
+        if: ${{ runner.os == 'Linux' || runner.os == 'Windows' }}
+        env:
+          IMAGE: ${{ steps.local-image.outputs.image }}
+          TARGET_SHA: ${{ steps.local-image.outputs.target-sha }}
+          LOCAL_TAGS: ${{ steps.local-image.outputs.tags }}
+          BUILD_STATUS: ${{ steps.local-image.outputs.status }}
+          PLATFORMS: ${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}
+        run: |
+          if [ "$BUILD_STATUS" != "local-built" ] || [ "$LOCAL_TAGS" != "$(printf '%s\n%s' "$IMAGE:local-smoke" "$IMAGE:$TARGET_SHA")" ]; then
+            echo "::error::❌ Local build did not report the expected status and image tags."
+            exit 1
+          fi
+          IFS=',' read -r -a platforms <<< "$PLATFORMS"
+          for tag in "$IMAGE:local-smoke" "$IMAGE:$TARGET_SHA"; do
+            for platform in "${platforms[@]}"; do
+              actual="$(docker image inspect --platform "$platform" --format '{{.Os}}/{{.Architecture}}' "$tag")"
+              if [ "$actual" != "$platform" ]; then
+                echo "::error::❌ Local image '$tag' has platform '$actual'; expected '$platform'."
+                exit 1
+              fi
+            done
+          done
+          echo "✅ Local image tags and platforms are retained."
       - name: Check tracked generated files
         run: git diff --exit-code HEAD --
 

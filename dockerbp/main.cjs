@@ -47,8 +47,11 @@ function normalizeInputs(env = process.env) {
     throw new Error('mode must be build, build-shard, or merge.');
   }
   const publishInput = env.DOCKERBP_PUBLISH?.trim().toLowerCase() || 'false';
-  if (!['true', 'false'].includes(publishInput)) {
-    throw new Error('publish must be true or false.');
+  if (!['true', 'false', 'local'].includes(publishInput)) {
+    throw new Error('publish must be true, false, or local.');
+  }
+  if (publishInput === 'local' && mode !== 'build') {
+    throw new Error('publish=local is supported only in mode=build; local images cannot be merged.');
   }
   const sha = (env.DOCKERBP_TARGET_SHA?.trim() || env.GITHUB_SHA || '').toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(sha)) {
@@ -81,6 +84,7 @@ function normalizeInputs(env = process.env) {
     platforms,
     tags,
     publish: publishInput === 'true',
+    local: publishInput === 'local',
     context: relativePath(env.DOCKERBP_CONTEXT, 'context', './'),
     dockerfile: relativePath(env.DOCKERBP_DOCKERFILE, 'dockerfile', 'Dockerfile'),
     records,
@@ -145,6 +149,20 @@ async function prepare(env = process.env, exec = execute, runnerOS = process.pla
     }
     if (config.backend === 'windows' && config.platforms[0] !== `windows/${server.Arch}`) {
       throw new Error('The Windows Docker daemon architecture must match the requested platform.');
+    }
+    if (config.local && config.backend === 'linux' && config.platforms.length > 1) {
+      const driverStatus = parseJSON(
+        await exec('docker', ['info', '--format', '{{json .DriverStatus}}']),
+        'Docker image-store information',
+      );
+      if (!Array.isArray(driverStatus) || !driverStatus.some(entry =>
+        Array.isArray(entry) && entry[0] === 'driver-type' &&
+        entry[1] === 'io.containerd.snapshotter.v1')) {
+        throw new Error(
+          'Multi-platform publish=local requires the Docker containerd image store. ' +
+          'Enable it on the runner or request a single platform; DockerBP does not change daemon configuration.',
+        );
+      }
     }
     emulation = config.platforms.map(platform => platform.split('/')[1])
       .filter(architecture => architecture !== server.Arch);
@@ -339,14 +357,18 @@ async function build(config, exec) {
   if (!config.sourceVerified) throw new Error('Source checkout must be verified before building.');
   const label = config.platforms.join('-').replaceAll('/', '-');
   const stagingTag = `${config.image}:dockerbp-${config.sha}-${label}-${crypto.randomBytes(8).toString('hex')}`;
+  const tagArgs = (config.local ? config.tags.map(tag => `${config.image}:${tag}`) : [stagingTag])
+    .flatMap(tag => ['--tag', tag]);
   let digest = '';
   if (config.backend === 'linux') {
     const metadata = path.join(config.workDirectory, 'build-metadata.json');
+    const output = config.local ? ['--load'] : [
+      '--output', config.publish ? 'type=image,push=true,oci-mediatypes=false' : 'type=cacheonly',
+    ];
     await exec('docker', [
       'buildx', 'build', '--platform', config.platforms.join(','),
       '--file', config.dockerfilePath, '--metadata-file', metadata,
-      '--provenance=false', '--sbom=false', '--tag', stagingTag,
-      '--output', config.publish ? 'type=image,push=true,oci-mediatypes=false' : 'type=cacheonly',
+      '--provenance=false', '--sbom=false', ...tagArgs, ...output,
       config.contextDirectory,
     ], { stream: true });
     if (config.publish) {
@@ -357,7 +379,7 @@ async function build(config, exec) {
     try {
       await exec('docker', [
         'image', 'build', '--platform', config.platforms[0],
-        '--file', config.dockerfilePath, '--tag', stagingTag, config.contextDirectory,
+        '--file', config.dockerfilePath, ...tagArgs, config.contextDirectory,
       ], { stream: true, env: { DOCKER_BUILDKIT: '0' } });
       built = true;
       if (config.publish) {
@@ -376,7 +398,7 @@ async function build(config, exec) {
         digest = reference ? reference.split('@')[1] : '';
       }
     } finally {
-      if (built) await exec('docker', ['image', 'rm', '--no-prune', stagingTag]);
+      if (built && !config.local) await exec('docker', ['image', 'rm', '--no-prune', stagingTag]);
     }
   }
   if (config.publish && !DIGEST.test(digest)) {
@@ -389,7 +411,7 @@ async function run(config, exec = execute, env = process.env) {
   let digest = '';
   let recordFile = '';
   let stagingTags = [];
-  let status = 'built';
+  let status = config.local ? 'local-built' : 'built';
   if (config.mode === 'merge') {
     const records = readBuildRecords(config);
     const registryEnv = manifestEnvironment(config, env);

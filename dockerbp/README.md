@@ -1,11 +1,11 @@
 # Docker Build and Publish
 
-**Latest version:** [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/dockerbp/v0.1.0)
-(tag: `dockerbp/v0.1.0`).
+**Latest version:** [v0.2.0](https://github.com/btnguyen2k/gh-actions/releases/tag/dockerbp/v0.2.0)
+(tag: `dockerbp/v0.2.0`).
 
 Build Linux multi-architecture images or native Windows images from an exact
-source commit, optionally publish to Docker Hub, and combine builds from separate
-jobs into one set of image tags.
+source commit, keep tagged images for local tests or publish to Docker Hub, and
+combine builds from separate jobs into one set of image tags.
 
 ## Quick start
 
@@ -26,14 +26,16 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         with:
           image: myorg/myapp
           platforms: linux/amd64,linux/arm64
 ```
 
 By default this **builds only**, retaining builder cache without loading or
-exporting a usable image. To publish, log in first and set `publish: true`:
+exporting a usable image. Set `publish: local` to retain tagged images for later
+steps in the same job; see the local-build examples below. To publish to Docker
+Hub, log in first and set `publish: true`:
 
 ```yaml
 steps:
@@ -41,7 +43,7 @@ steps:
     with:
       username: ${{ vars.DOCKERHUB_USERNAME }}
       password: ${{ secrets.DOCKERHUB_TOKEN }}
-  - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+  - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
     id: image
     with:
       mode: build
@@ -53,8 +55,10 @@ steps:
       publish: true
 ```
 
-Every final publication includes `<image>:<full-pinned-SHA>`, in addition to
-the requested tags. Only Docker Hub is supported. The action does not log in,
+Every final publication or local build includes `<image>:<full-pinned-SHA>`,
+in addition to the requested tags. Only Docker Hub image naming and registry
+publication are supported. Local builds do not push to a registry; private
+base images may still require pull credentials. The action does not log in,
 create repositories, or manage registry credentials.
 
 ## Inputs
@@ -66,9 +70,9 @@ duplicate entries are removed.
 | --- | --- | --- |
 | `image` | Required | Lowercase Docker Hub name, for example `myorg/myapp` or `docker.io/myorg/myapp`, without a tag/digest. A bare repository name uses `library/`. |
 | `target-sha` | `github.sha` | Full 40-character source commit SHA. Branch names and short SHAs are rejected. |
-| `tags` | `latest` | Bare image tags. The full pinned SHA is always added. In `build-shard`, these are planned final references, not published tags. |
+| `tags` | `latest` | Bare image tags. The full pinned SHA is always added. Applied to local images with `publish: local`; in `build-shard`, these are planned final references, not published tags. |
 | `platforms` | `linux/amd64` | Platforms to build; in `merge`, the complete expected platform set. Recognized values: `linux/amd64`, `linux/arm64`, `windows/amd64`, `windows/arm64`. See runner requirements below. |
-| `publish` | `false` | Build only when false; publish when true. Must be `true` or `false`, case-insensitive. |
+| `publish` | `"false"` | String: `false` for cache-only builds, `true` for Docker Hub publication, or `local` to retain tagged images. Case-insensitive. `local` requires `mode: build`; `merge` requires `true`. |
 | `dockerfile` | `Dockerfile` | Dockerfile path relative to `context`. |
 | `context` | `./` | Directory relative to the pinned checkout. Absolute paths, parent traversal, and symlinks escaping the checkout/context are rejected. |
 | `mode` | `build` | `build`, `build-shard`, or `merge`, as described below. |
@@ -78,7 +82,7 @@ duplicate entries are removed.
 
 | Mode | Behavior |
 | --- | --- |
-| `build` | Build one job's platforms. With `publish: true`, push a unique staging tag and publish the final tags. |
+| `build` | Build one job's platforms. With `publish: true`, push a unique staging tag and publish the final tags. With `publish: local`, retain the requested local tags and full-SHA tag without pushing. |
 | `build-shard` | Build one job's platforms. With `publish: true`, push only a unique staging tag and return a transferable result file. Never changes final tags. |
 | `merge` | Validate published result files and their immutable registry manifests, then publish the final combined tags. Requires `publish: true`; does not check out source or need a Docker daemon. |
 
@@ -91,13 +95,13 @@ Linux cache is not exported and may be removed by Buildx's post-job cleanup.
 
 | Output | Format |
 | --- | --- |
-| `status` | Currently `built`, `shard-published`, or `published` on success. Future versions may add status values; see the error-reporting note below. |
+| `status` | Currently `built` for cache-only builds, `local-built` for retained local images, `shard-published`, or `published` on success. Future versions may add status values; see the error-reporting note below. |
 | `image` | Canonical `docker.io/<namespace>/<repository>`. |
 | `target-sha` | Full pinned SHA. |
-| `tags` | Newline-separated final image references, including the SHA tag. Planned only when build-only or in `build-shard`. |
-| `digest` | Published manifest-list digest; a shard returns its own image/index digest. Empty when build-only. |
-| `record-file` | Absolute JSON result path for a build; empty in `merge`. Upload this file, not its parent directory. Build-only records cannot be merged. |
-| `staging-tags` | Newline-separated staging references for caller-managed retention. Empty when build-only. |
+| `tags` | Newline-separated final image references, including the SHA tag. Present locally with `publish: local`; planned only with `publish: false` or in `build-shard`. |
+| `digest` | Published manifest-list digest; a published shard returns its own image/index digest. Empty with `publish: false` or `publish: local`. |
+| `record-file` | Absolute JSON result path for a build; empty in `merge`. Upload this file, not its parent directory. Cache-only and local records are unpublished and cannot be merged. |
+| `staging-tags` | Newline-separated staging references for caller-managed retention. Empty with `publish: false` or `publish: local`. |
 
 **Error reporting:** Fatal errors currently fail the action; this version does
 not return a dedicated error status. Error reporting and output status values
@@ -118,6 +122,7 @@ build invocation.
 | --- | --- |
 | One Linux platform or one native Windows architecture/base-OS version | `build` |
 | Linux AMD64 + ARM64 from one job, using emulation when needed | `build` |
+| Keep images for local tests, including Linux multi-platform images with a containerd image store | `build` with `publish: local` |
 | Native Linux AMD64 + ARM64 builds on separate runners | `build-shard` then `merge` |
 | Linux + Windows under the same image tags | `build-shard` then `merge` |
 | Build first, then apply final tags after validation or approval, even for one platform | `build-shard` then `merge` |
@@ -145,7 +150,7 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         with:
           mode: build
           image: myorg/myapp
@@ -158,9 +163,10 @@ leave an image for a subsequent `docker run`, and their records cannot be merged
 
 ### `build`: check a Windows image without publishing
 
-`build` supports Windows images in a single native Windows job, either build-only
-or with direct publication. The Docker daemon must run Windows containers and
-match the requested architecture. Each Windows job builds one architecture.
+`build` supports Windows images in a single native Windows job: cache-only,
+retained locally, or published directly. The Docker daemon must run Windows
+containers and match the requested architecture. Each Windows job builds one
+architecture.
 
 This workflow checks Windows AMD64 using a compatible `Dockerfile.windows` in
 the caller repository, without login, artifact transfer, or a merge job:
@@ -176,7 +182,7 @@ jobs:
   image:
     runs-on: windows-latest
     steps:
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         with:
           mode: build
           image: myorg/myapp-windows
@@ -189,10 +195,120 @@ Windows jobs must set `platforms` explicitly because the default is
 `linux/amd64`. This build-only run returns `status: built` without a published
 digest or a retained tagged runnable image.
 
+To retain the Windows image for later steps instead, set `publish: local` and
+optionally supply `tags`. The requested tags and full-SHA tag remain in the
+Windows daemon, with `status: local-built`. No registry login or merge job is
+needed.
+
 To publish directly from this Windows job, use a trusted push or manual trigger
 instead of untrusted pull requests, log in to Docker Hub before the action, and
 set `publish: true`. `build` then publishes the requested final tags plus the
 full-SHA tag; no `build-shard` or `merge` invocation is needed.
+
+### `build`: retain tagged images for local tests
+
+Use `publish: local` to build without pushing and keep the result in the current
+Docker daemon. Both Linux and Windows retain the requested tags plus the full
+pinned source SHA; empty `tags` still defaults to `latest`.
+
+This Linux example builds one platform, so it works with either a classic or
+containerd image store. It then checks that the SHA-tagged image is available
+after the action finishes:
+
+```yaml
+name: Check local Docker image
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
+        id: image
+        with:
+          mode: build
+          image: myorg/myapp
+          platforms: linux/amd64
+          tags: local-test
+          publish: local
+      - name: Inspect retained image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          SOURCE_SHA: ${{ steps.image.outputs.target-sha }}
+        run: docker image inspect --format '{{.Id}}' "$IMAGE:$SOURCE_SHA"
+```
+
+The local tags are `myorg/myapp:local-test` and `myorg/myapp:<full-pinned-SHA>`.
+Subsequent steps can run containers from those tags. The status is `local-built`;
+`digest` and `staging-tags` are empty, and the result record cannot be merged.
+
+Images remain only for the lifetime of that daemon/runner; they are not
+transferred to another job. Action cleanup removes its private checkout and
+configuration, not these local images. Existing local tags with the same names
+may be updated; callers own retention and concurrency on shared daemons.
+
+### `build`: retain Linux multi-platform images locally
+
+**Multi-platform local images are supported with Docker's containerd image
+store. The classic image store cannot retain manifest lists.** DockerBP checks
+the daemon before a multi-platform local build and fails clearly if the store
+is unsupported; it never silently drops platforms, pushes instead, or changes
+the caller's daemon configuration.
+
+On GitHub-hosted Linux runners, configure a job-local Docker daemon before the
+action. This example follows Docker's
+[multi-platform loading guidance](https://docs.docker.com/build/ci/github-actions/multi-platform/#build-and-load-multi-platform-images):
+
+```yaml
+name: Check local multi-platform image
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-docker-action@v5
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
+        id: image
+        with:
+          mode: build
+          image: myorg/myapp
+          platforms: linux/amd64,linux/arm64
+          tags: local-test
+          publish: local
+      - name: Inspect locally loaded platforms
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          SOURCE_SHA: ${{ steps.image.outputs.target-sha }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker image inspect --platform "$platform" --format '{{.Os}}/{{.Architecture}}' "$IMAGE:$SOURCE_SHA"
+          done
+```
+
+Both tags reference the locally loaded multi-platform image. Docker selects the
+host-compatible platform when running it; executing another architecture still
+requires emulation or a compatible host.
+
+Windows local builds still target one native architecture. `publish: local`
+does not combine Linux/Windows jobs or multiple Windows versions. Use
+`publish: true` with `build-shard` and `merge` for distributed registry
+publication; local records cannot be merged.
 
 ### `build`: select a source commit and custom paths
 
@@ -218,7 +334,7 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         with:
           mode: build
           image: myorg/api
@@ -253,7 +369,7 @@ build-windows:
       with:
         username: ${{ vars.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+    - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
       id: shard
       with:
         mode: build-shard
@@ -302,7 +418,7 @@ merge-windows:
       with:
         username: ${{ vars.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+    - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
       id: image
       with:
         mode: merge
@@ -374,7 +490,7 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         id: shard
         with:
           mode: build-shard
@@ -401,7 +517,7 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         id: image
         with:
           mode: merge
@@ -453,7 +569,7 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         id: image
         with:
           mode: build-shard
@@ -481,7 +597,7 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.1.0
+      - uses: btnguyen2k/gh-actions/dockerbp@dockerbp/v0.2.0
         id: image
         with:
           mode: merge
@@ -525,7 +641,9 @@ process when no longer needed.
 ### Choose image tags without accidentally publishing `latest`
 
 These are application image tags, independent of the DockerBP action version.
-Every final publication also includes the full pinned source SHA.
+Every final publication or local build also includes the full pinned source SHA.
+With `publish: local`, the same tag rules apply only to the local daemon;
+registry tags are unchanged.
 
 | Goal | `tags` input | Tags besides the automatic SHA tag |
 | --- | --- | --- |
@@ -596,7 +714,7 @@ Use a current Actions runner: the pinned checkout/setup helpers use Node.js 24.
 
 | Platform | Requirements |
 | --- | --- |
-| `linux/amd64`, `linux/arm64` | Native Linux runner with a Linux Docker daemon. The action provisions Buildx and QEMU when the requested architecture differs from the daemon. QEMU setup requires privileged container support. Both platforms may share one job. |
+| `linux/amd64`, `linux/arm64` | Native Linux runner with a Linux Docker daemon. The action provisions Buildx and QEMU when the requested architecture differs from the daemon. QEMU setup requires privileged container support. Both platforms may share one job; multi-platform `publish: local` requires the containerd image store. |
 | `windows/amd64` | Native Windows runner with Docker in Windows-container mode and a compatible Windows base image. One architecture per job. CI covers the `windows-latest` host with Nano Server `ltsc2025`. |
 | `windows/arm64` | Recognized, but requires an actually capable native Windows ARM64 container daemon and compatible base images. Standard GitHub-hosted Windows ARM64 images do not provide this setup. No Windows ARM64 execution coverage is claimed. |
 | Merge | Any runner meeting the CLI/Bash/Node requirements. Registry operations do not require a Docker daemon. |
@@ -606,6 +724,13 @@ cannot build Windows containers. Windows builds use Docker's native legacy
 builder with `DOCKER_BUILDKIT=0`; experimental Windows BuildKit is not required.
 Docker's `manifest` CLI, used for registry-only merging, is itself marked
 experimental by Docker.
+
+For local images, a single platform works with a classic or containerd image
+store. Linux multi-platform loading requires the containerd store; see Docker's
+[configuration guidance](https://docs.docker.com/engine/storage/containerd/).
+Docker Engine 29+ uses it by default on fresh installations, but upgraded or
+preconfigured runners may still use classic storage. DockerBP checks the active
+store rather than assuming support from the Docker version.
 
 Linux publication uses Docker schema-2 manifests without provenance/SBOM
 attestations so native Windows and Linux results can be combined consistently.

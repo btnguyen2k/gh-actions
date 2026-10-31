@@ -119,6 +119,8 @@ test('rejects malformed or unsafe inputs rather than passing them to a shell', (
     [{ DOCKERBP_TAGS: '$(whoami)' }, /bare Docker tags/],
     [{ DOCKERBP_TAGS: `a${'b'.repeat(128)}` }, /bare Docker tags/],
     [{ DOCKERBP_PUBLISH: 'yes' }, /publish must/],
+    [{ DOCKERBP_MODE: 'build-shard', DOCKERBP_PUBLISH: 'local' }, /only in mode=build/],
+    [{ DOCKERBP_MODE: 'merge', DOCKERBP_PUBLISH: 'local', DOCKERBP_BUILD_RECORDS: 'records' }, /only in mode=build/],
     [{ DOCKERBP_MODE: 'unknown' }, /mode must/],
     [{ DOCKERBP_PLATFORMS: 'linux/386' }, /platforms must/],
     [{ DOCKERBP_PLATFORMS: 'linux/amd64,windows/amd64' }, /separate build-shard/],
@@ -177,6 +179,44 @@ test('merge preparation does not contact a Docker daemon or allocate a source ch
   assert.equal(result.sourceDirectory, undefined);
 });
 
+test('multi-platform local preparation requires containerd before allocating build files', async t => {
+  const { root, config } = fixture(t);
+  const output = path.join(root, 'output.txt');
+  const env = {
+    ...inputs({ DOCKERBP_PUBLISH: ' LOCAL ', DOCKERBP_PLATFORMS: 'linux/amd64,linux/arm64' }),
+    GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root, GITHUB_OUTPUT: output,
+  };
+  const exec = driverStatus => async (command, args) => {
+    assert.equal(command, 'docker');
+    if (args[0] === 'version') return '{"Os":"linux","Arch":"amd64"}';
+    assert.deepEqual(args, ['info', '--format', '{{json .DriverStatus}}']);
+    return JSON.stringify(driverStatus);
+  };
+  for (const status of [[['Backing Filesystem', 'extfs']], [], null]) {
+    await assert.rejects(prepare(env, exec(status), 'linux'), /requires the Docker containerd image store/);
+    assert.equal(fs.existsSync(output), false);
+  }
+  const result = await prepare(env, exec([['driver-type', 'io.containerd.snapshotter.v1']]), 'linux');
+  t.after(() => cleanup(result));
+  assert.equal(result.publish, false);
+  assert.equal(result.local, true);
+  assert.match(fs.readFileSync(output, 'utf8'), /qemu-platforms<<[^\n]+\narm64\n/);
+});
+
+test('single-platform local preparation does not require a containerd image store', async t => {
+  const { root, config } = fixture(t);
+  const result = await prepare({
+    ...inputs({ DOCKERBP_PUBLISH: 'local' }),
+    GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root, GITHUB_OUTPUT: path.join(root, 'output.txt'),
+  }, async (command, args) => {
+    assert.equal(command, 'docker');
+    assert.deepEqual(args, ['version', '--format', '{{json .Server}}']);
+    return '{"Os":"linux","Arch":"amd64"}';
+  }, 'linux');
+  t.after(() => cleanup(result));
+  assert.equal(result.local, true);
+});
+
 test('verifies the exact checkout SHA before resolving the build paths', async t => {
   const { config } = fixture(t, { sourceVerified: false });
   await assert.rejects(verifySource(config, async () => 'b'.repeat(40)), /does not match/);
@@ -219,6 +259,34 @@ test('Linux build-only is cache-only and cannot produce a mergeable registry res
   const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
   assert.equal(built.published, false);
   assert.deepEqual(built.manifests, []);
+});
+
+test('Linux local builds load every requested platform with requested and full-SHA tags', async t => {
+  for (const platforms of ['linux/amd64', 'linux/amd64,linux/arm64']) {
+    await t.test(platforms, async t => {
+      const { config, env } = fixture(t, normalizeInputs(inputs({
+        DOCKERBP_PUBLISH: 'local', DOCKERBP_PLATFORMS: platforms,
+        DOCKERBP_TAGS: `test,latest,test,${SHA}`,
+      })));
+      const { exec, calls } = fakeDocker(config);
+      const result = await run(config, exec, env);
+      assert.equal(calls.length, 1);
+      const args = calls[0].args;
+      assert.ok(args.includes('--load'));
+      assert.equal(args.includes('--output'), false);
+      assert.equal(args[args.indexOf('--platform') + 1], platforms);
+      const tags = args.flatMap((value, index) => value === '--tag' ? [args[index + 1]] : []);
+      assert.deepEqual(tags, [`${IMAGE}:test`, `${IMAGE}:latest`, `${IMAGE}:${SHA}`]);
+      assert.equal(result.tags, tags.join('\n'));
+      assert.equal(result.status, 'local-built');
+      assert.equal(result.digest, '');
+      assert.equal(result['staging-tags'], '');
+      assert.equal(fs.existsSync(path.join(config.workDirectory, 'docker-config')), false);
+      assert.equal(JSON.parse(fs.readFileSync(result['record-file'], 'utf8')).published, false);
+      cleanup(config);
+      assert.equal(calls.length, 1);
+    });
+  }
 });
 
 test('a published Linux shard emits immutable metadata but never changes final tags', async t => {
@@ -267,6 +335,42 @@ test('native Windows build-only removes its temporary tag without pushing', asyn
   const { exec, calls } = fakeDocker(config);
   assert.equal((await run(config, exec, env)).status, 'built');
   assert.deepEqual(calls.map(call => call.args.slice(0, 2)), [['image', 'build'], ['image', 'rm']]);
+});
+
+test('native Windows local builds retain requested and full-SHA tags without pushing or removing them', async t => {
+  const { config, env } = fixture(t, normalizeInputs(inputs({
+    DOCKERBP_PUBLISH: 'local', DOCKERBP_PLATFORMS: 'windows/amd64',
+    DOCKERBP_TAGS: 'test,latest',
+  })));
+  const { exec, calls } = fakeDocker(config);
+  const result = await run(config, exec, env);
+  assert.equal(calls.length, 1);
+  const args = calls[0].args;
+  assert.deepEqual(args.slice(0, 4), ['image', 'build', '--platform', 'windows/amd64']);
+  assert.equal(calls[0].options.env.DOCKER_BUILDKIT, '0');
+  const tags = args.flatMap((value, index) => value === '--tag' ? [args[index + 1]] : []);
+  assert.deepEqual(tags, [`${IMAGE}:test`, `${IMAGE}:latest`, `${IMAGE}:${SHA}`]);
+  assert.equal(result.tags, tags.join('\n'));
+  assert.equal(result.status, 'local-built');
+  assert.equal(result.digest, '');
+  assert.equal(result['staging-tags'], '');
+  assert.equal(JSON.parse(fs.readFileSync(result['record-file'], 'utf8')).published, false);
+  cleanup(config);
+  assert.equal(calls.length, 1);
+});
+
+test('failed local builds stay fatal without removing existing local tags or writing result records', async t => {
+  for (const platform of ['linux/amd64', 'windows/amd64']) {
+    await t.test(platform, async t => {
+      const { config, env } = fixture(t, normalizeInputs(inputs({
+        DOCKERBP_PUBLISH: 'local', DOCKERBP_PLATFORMS: platform,
+      })));
+      const { exec, calls } = fakeDocker(config, [LINUX], args => args[1] === 'build');
+      await assert.rejects(run(config, exec, env), /Simulated Docker failure/);
+      assert.equal(calls.length, 1);
+      assert.equal(fs.existsSync(config.recordFile), false);
+    });
+  }
 });
 
 test('Windows push failures stay fatal and still remove the private local tag', async t => {
@@ -391,7 +495,7 @@ test('CLI reports malformed inputs as fatal errors from an unrelated working dir
     encoding: 'utf8',
   });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /::error::publish must be true or false/);
+  assert.match(result.stderr, /::error::publish must be true, false, or local/);
   assert.equal(fs.existsSync(filename), false);
 });
 
