@@ -1,4 +1,4 @@
-# Version: 0.1.0
+# Version: 0.2.0
 name: Docker Build and Publish
 description: Build Linux or Windows images and combine distributed builds into Docker Hub tags.
 
@@ -16,7 +16,7 @@ inputs:
     description: Comma-separated or multiline platforms to build (e.g. linux/amd64, linux/arm64), or the complete expected set in merge mode.
     default: linux/amd64
   publish:
-    description: Publish to Docker Hub instead of building only. Merge mode requires true.
+    description: "String: false for cache-only builds, true to publish to Docker Hub, or local to retain tagged images in build mode. Merge requires true."
     default: "false"
   dockerfile:
     description: Dockerfile path relative to the build context.
@@ -33,7 +33,7 @@ inputs:
 
 outputs:
   status:
-    description: built, shard-published, or published.
+    description: built, local-built, shard-published, or published.
     value: ${{ steps.execute.outputs.status }}
   image:
     description: Canonical Docker Hub image name.
@@ -42,10 +42,10 @@ outputs:
     description: Full pinned source commit SHA.
     value: ${{ steps.execute.outputs.target-sha }}
   tags:
-    description: Newline-separated final image references, including the full SHA tag. Not applied by build-shard.
+    description: Newline-separated final image references, including the full SHA tag. Applied locally with publish=local; otherwise planned unless published.
     value: ${{ steps.execute.outputs.tags }}
   digest:
-    description: Published manifest digest; empty for build-only runs. A shard returns its own digest.
+    description: Published manifest digest; empty for cache-only or local builds. A published shard returns its own digest.
     value: ${{ steps.execute.outputs.digest }}
   record-file:
     description: Absolute path to a JSON build result for artifact transfer; empty in merge mode.
