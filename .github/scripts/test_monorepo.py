@@ -1356,6 +1356,69 @@ class DockerBPWorkflowTests(CIWorkflowTestCase):
         self.assertEqual(self.jobs["ValidatePass"]["needs"], "Validate")
         self.assertLess(steps.index(build), len(steps) - 1)
 
+    def test_native_local_checks_configure_the_image_store_and_verify_retained_tags(self):
+        steps = self.jobs["Validate"]["steps"]
+        setup = next(step for step in steps if step.get("uses", "").startswith("docker/setup-docker-action@"))
+        local = next(
+            step for step in steps
+            if step.get("uses") == "./dockerbp" and step["with"]["publish"] == "local"
+        )
+        check = next(step for step in steps if step.get("name") == "Check retained local Docker images")
+        for step in (setup, local, check):
+            self.assertEqual(step["if"], "${{ runner.os == 'Linux' || runner.os == 'Windows' }}")
+            self.assertNotIn("continue-on-error", step)
+        self.assertIn("containerd-snapshotter", setup["with"]["daemon-config"])
+        self.assertLess(steps.index(setup), steps.index(local))
+        self.assertLess(steps.index(local), steps.index(check))
+        self.assertEqual(local["with"]["target-sha"], "${{ needs.CaptureContext.outputs.target-sha }}")
+        self.assertEqual(local["with"]["platforms"], (
+            "${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}"
+        ))
+        self.assertEqual(check["env"]["LOCAL_TAGS"], "${{ steps.local-image.outputs.tags }}")
+        self.assertEqual(check["env"]["TARGET_SHA"], "${{ steps.local-image.outputs.target-sha }}")
+        self.assertNotIn("${{", check["run"])
+        self.assertLess(steps.index(check), len(steps) - 1)
+
+    def test_local_image_check_rejects_missing_tags_and_wrong_platforms(self):
+        check = next(
+            step for step in self.jobs["Validate"]["steps"]
+            if step.get("name") == "Check retained local Docker images"
+        )
+        image, sha = "docker.io/dockerbp-ci/local", "a" * 40
+        environment = {
+            "IMAGE": image, "TARGET_SHA": sha,
+            "LOCAL_TAGS": f"{image}:local-smoke\n{image}:{sha}",
+            "BUILD_STATUS": "local-built", "PLATFORMS": "linux/amd64,linux/arm64",
+            "MISSING_SHA_TAG": "", "WRONG_PLATFORM": "",
+        }
+        docker = """
+docker() {
+  if [ "$MISSING_SHA_TAG" = "true" ] && [ "$7" = "$IMAGE:$TARGET_SHA" ]; then
+    return 1
+  fi
+  printf '%s\\n' "${WRONG_PLATFORM:-$4}"
+}
+"""
+        cases = (
+            ("Linux multi-platform", {}, True),
+            ("Windows native", {"PLATFORMS": "windows/amd64"}, True),
+            ("wrong status", {"BUILD_STATUS": "built"}, False),
+            ("missing reported tag", {"LOCAL_TAGS": f"{image}:local-smoke"}, False),
+            ("missing local SHA tag", {"MISSING_SHA_TAG": "true"}, False),
+            ("wrong platform", {"WRONG_PLATFORM": "linux/386"}, False),
+        )
+        for name, overrides, succeeds in cases:
+            with self.subTest(name=name):
+                result = self.run_step(
+                    {**check, "run": docker + check["run"]},
+                    {**environment, **overrides},
+                )
+                if succeeds:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("✅ Local image tags and platforms are retained.", result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 class CIContextWorkflowTests(CIWorkflowTestCase):
     def setUp(self):
