@@ -14,7 +14,7 @@ workflows.
 | Action | Latest version | Description |
 | --- | --- | --- |
 | [automerge-dependabot](automerge-dependabot/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/automerge-dependabot/v0.1.0) | Merge eligible Dependabot PRs after successful CI for their current head. |
-| [dockerbp](dockerbp/README.md) | [v0.2.0](https://github.com/btnguyen2k/gh-actions/releases/tag/dockerbp/v0.2.0) | Build Docker images for local testing or Docker Hub publication, and combine Linux/Windows jobs into shared tags. |
+| [dockerbp](dockerbp/README.md) | [v0.3.0](https://github.com/btnguyen2k/gh-actions/releases/tag/dockerbp/v0.3.0) | Build Linux AMD64/ARM64 or Windows AMD64 from pinned source or your checkout, retain local images, and publish or combine jobs without Linux staging tags. |
 | [workflow-context](workflow-context/README.md) | [v0.1.0](https://github.com/btnguyen2k/gh-actions/releases/tag/workflow-context/v0.1.0) | Standardize workflow context and share event, SHA/branch, PR, and run metadata across jobs. |
 
 See each action's README for inputs, outputs, permissions, and supported runners.

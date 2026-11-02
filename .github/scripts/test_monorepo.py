@@ -1346,6 +1346,7 @@ class DockerBPWorkflowTests(CIWorkflowTestCase):
         self.assertEqual(build["if"], "${{ runner.os == 'Linux' || runner.os == 'Windows' }}")
         self.assertEqual(build["with"]["target-sha"], "${{ needs.CaptureContext.outputs.target-sha }}")
         self.assertIs(build["with"]["publish"], False)
+        self.assertNotIn("checkout", build["with"])
         self.assertEqual(build["with"]["platforms"], (
             "${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}"
         ))
@@ -1371,12 +1372,45 @@ class DockerBPWorkflowTests(CIWorkflowTestCase):
         self.assertLess(steps.index(setup), steps.index(local))
         self.assertLess(steps.index(local), steps.index(check))
         self.assertEqual(local["with"]["target-sha"], "${{ needs.CaptureContext.outputs.target-sha }}")
+        self.assertIs(local["with"]["checkout"], False)
         self.assertEqual(local["with"]["platforms"], (
             "${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}"
         ))
         self.assertEqual(check["env"]["LOCAL_TAGS"], "${{ steps.local-image.outputs.tags }}")
         self.assertEqual(check["env"]["TARGET_SHA"], "${{ steps.local-image.outputs.target-sha }}")
         self.assertNotIn("${{", check["run"])
+        self.assertLess(steps.index(check), len(steps) - 1)
+
+    def test_action_skips_optional_checkout_but_still_verifies_the_source(self):
+        from ruamel.yaml import YAML
+
+        action = YAML(typ="safe").load(
+            (monorepo.ROOT / "dockerbp" / "action.yml").read_text(encoding="utf-8")
+        )
+        steps = action["runs"]["steps"]
+        prepare = next(step for step in steps if step.get("id") == "prepare")
+        checkout = next(step for step in steps if step.get("name") == "Checkout pinned source")
+        verify = next(step for step in steps if step.get("name") == "Verify pinned source and build paths")
+        self.assertEqual(action["inputs"]["checkout"]["default"], "true")
+        self.assertEqual(prepare["env"]["DOCKERBP_CHECKOUT"], "${{ inputs.checkout }}")
+        self.assertEqual(checkout["if"], "${{ steps.prepare.outputs.checkout == 'true' }}")
+        self.assertEqual(verify["if"], "${{ steps.prepare.outputs.backend != 'merge' }}")
+        self.assertLess(steps.index(checkout), steps.index(verify))
+
+    def test_native_digest_publication_is_required_after_docker_setup(self):
+        steps = self.jobs["Validate"]["steps"]
+        setup = next(step for step in steps if step.get("uses", "").startswith("docker/setup-docker-action@"))
+        check = next(
+            step for step in steps
+            if step.get("name") == "Check native Linux digest publication against a local registry"
+        )
+        self.assertEqual(check["if"], "${{ runner.os == 'Linux' }}")
+        self.assertEqual(check["env"], {"DOCKERBP_NATIVE_PUBLISH_TEST": "true"})
+        self.assertIn('--test-name-pattern="native Linux publication"', check["run"])
+        self.assertIn("dockerbp/tests/manifest.test.cjs", check["run"])
+        self.assertNotIn("${{", check["run"])
+        self.assertNotIn("continue-on-error", check)
+        self.assertLess(steps.index(setup), steps.index(check))
         self.assertLess(steps.index(check), len(steps) - 1)
 
     def test_local_image_check_rejects_missing_tags_and_wrong_platforms(self):

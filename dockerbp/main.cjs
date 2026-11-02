@@ -6,7 +6,7 @@ const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
-const PLATFORMS = new Set(['linux/amd64', 'linux/arm64', 'windows/amd64', 'windows/arm64']);
+const PLATFORMS = new Set(['linux/amd64', 'linux/arm64', 'windows/amd64']);
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 const COMPONENT = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
@@ -46,6 +46,10 @@ function normalizeInputs(env = process.env) {
   if (!['build', 'build-shard', 'merge'].includes(mode)) {
     throw new Error('mode must be build, build-shard, or merge.');
   }
+  const checkoutInput = env.DOCKERBP_CHECKOUT?.trim().toLowerCase() || 'true';
+  if (!['true', 'false'].includes(checkoutInput)) {
+    throw new Error('checkout must be true or false.');
+  }
   const publishInput = env.DOCKERBP_PUBLISH?.trim().toLowerCase() || 'false';
   if (!['true', 'false', 'local'].includes(publishInput)) {
     throw new Error('publish must be true, false, or local.');
@@ -81,6 +85,7 @@ function normalizeInputs(env = process.env) {
     mode,
     image: imageName(env.DOCKERBP_IMAGE),
     sha,
+    checkout: checkoutInput === 'true',
     platforms,
     tags,
     publish: publishInput === 'true',
@@ -171,7 +176,9 @@ async function prepare(env = process.env, exec = execute, runnerOS = process.pla
   config.workDirectory = path.join(directory, 'work');
   fs.mkdirSync(config.workDirectory, { mode: 0o700 });
   if (config.backend !== 'merge') {
-    config.sourceDirectory = fs.mkdtempSync(path.join(config.workspace, '.dockerbp-source-'));
+    config.sourceDirectory = config.checkout
+      ? fs.mkdtempSync(path.join(config.workspace, '.dockerbp-source-'))
+      : config.workspace;
   }
   const label = config.platforms.join('-').replaceAll('/', '-');
   config.recordFile = path.join(directory, `dockerbp-${label}-${crypto.randomUUID()}.json`);
@@ -180,8 +187,9 @@ async function prepare(env = process.env, exec = execute, runnerOS = process.pla
   writeOutputs({
     configuration,
     backend: config.backend,
+    checkout: config.checkout && config.backend !== 'merge',
     'target-sha': config.sha,
-    'checkout-path': config.sourceDirectory ? path.basename(config.sourceDirectory) : '',
+    'checkout-path': config.checkout && config.sourceDirectory ? path.basename(config.sourceDirectory) : '',
     'qemu-platforms': emulation.join(','),
   }, env.GITHUB_OUTPUT);
   return config;
@@ -327,25 +335,27 @@ function readBuildRecords(config) {
   }
   collect(path.resolve(config.workspace, config.records));
   if (!files.length || files.length > PLATFORMS.size) {
-    throw new Error('build-records must contain between one and four JSON result files.');
+    throw new Error(`build-records must contain between one and ${PLATFORMS.size} JSON result files.`);
   }
   const records = files.map(filename => {
     const record = parseJSON(fs.readFileSync(filename, 'utf8'), 'Build record');
-    if (!record || record.schema !== 1 || record.published !== true ||
+    if (!record || ![1, 2].includes(record.schema) || record.published !== true ||
         record.image !== config.image || record.targetSha !== config.sha ||
         !DIGEST.test(record.digest) || !Array.isArray(record.platforms) ||
         !Array.isArray(record.manifests) || !record.manifests.length) {
-      throw new Error('Build records must be published schema-1 results for the same image and target-sha.');
+      throw new Error('Build records must be published schema-1 or schema-2 results for the same image and target-sha.');
     }
     if (record.platforms.some(platform => !PLATFORMS.has(platform))) {
       throw new Error('A build record declares an unsupported platform.');
     }
     record.manifests = record.manifests.map(descriptor);
     validateCoverage(record.manifests, record.platforms);
-    const prefix = `${config.image}:`;
-    if (typeof record.stagingTag !== 'string' || !record.stagingTag.startsWith(prefix) ||
-        !TAG.test(record.stagingTag.slice(prefix.length))) {
-      throw new Error('A build record contains an invalid staging tag.');
+    if (record.schema === 1 || (record.stagingTag !== undefined && record.stagingTag !== '')) {
+      const prefix = `${config.image}:`;
+      if (typeof record.stagingTag !== 'string' || !record.stagingTag.startsWith(prefix) ||
+          !TAG.test(record.stagingTag.slice(prefix.length))) {
+        throw new Error('A build record contains an invalid staging tag.');
+      }
     }
     return record;
   });
@@ -356,14 +366,17 @@ function readBuildRecords(config) {
 async function build(config, exec) {
   if (!config.sourceVerified) throw new Error('Source checkout must be verified before building.');
   const label = config.platforms.join('-').replaceAll('/', '-');
-  const stagingTag = `${config.image}:dockerbp-${config.sha}-${label}-${crypto.randomBytes(8).toString('hex')}`;
-  const tagArgs = (config.local ? config.tags.map(tag => `${config.image}:${tag}`) : [stagingTag])
+  const stagingTag = config.publish && config.backend === 'linux' ? '' :
+    `${config.image}:dockerbp-${config.sha}-${label}-${crypto.randomBytes(8).toString('hex')}`;
+  const tagArgs = (config.local ? config.tags.map(tag => `${config.image}:${tag}`) : stagingTag ? [stagingTag] : [])
     .flatMap(tag => ['--tag', tag]);
   let digest = '';
   if (config.backend === 'linux') {
     const metadata = path.join(config.workDirectory, 'build-metadata.json');
     const output = config.local ? ['--load'] : [
-      '--output', config.publish ? 'type=image,push=true,oci-mediatypes=false' : 'type=cacheonly',
+      '--output', config.publish
+        ? `type=image,name=${config.image},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false`
+        : 'type=cacheonly',
     ];
     await exec('docker', [
       'buildx', 'build', '--platform', config.platforms.join(','),
@@ -424,7 +437,7 @@ async function run(config, exec = execute, env = process.env) {
       }
     }
     digest = await publishManifests(config, records.flatMap(record => record.manifests), exec, registryEnv);
-    stagingTags = records.map(record => record.stagingTag);
+    stagingTags = records.map(record => record.stagingTag).filter(Boolean);
     status = 'published';
   } else {
     const result = await build(config, exec);
@@ -434,10 +447,10 @@ async function run(config, exec = execute, env = process.env) {
       registryEnv = manifestEnvironment(config, env);
       manifests = await inspectManifests(config, result.digest, exec, registryEnv);
       validateCoverage(manifests, config.platforms);
-      stagingTags = [result.stagingTag];
+      stagingTags = result.stagingTag ? [result.stagingTag] : [];
     }
     const record = {
-      schema: 1, image: config.image, targetSha: config.sha, published: config.publish,
+      schema: config.publish ? 2 : 1, image: config.image, targetSha: config.sha, published: config.publish,
       platforms: config.platforms, digest: result.digest, stagingTag: result.stagingTag, manifests,
     };
     recordFile = config.recordFile;
@@ -463,7 +476,7 @@ async function run(config, exec = execute, env = process.env) {
 }
 
 function cleanup(config) {
-  if (config.sourceDirectory && (path.dirname(config.sourceDirectory) !== config.workspace ||
+  if (config.checkout && config.sourceDirectory && (path.dirname(config.sourceDirectory) !== config.workspace ||
       !path.basename(config.sourceDirectory).startsWith('.dockerbp-source-'))) {
     throw new Error('Refusing to remove an unexpected source checkout path.');
   }
@@ -472,7 +485,7 @@ function cleanup(config) {
     throw new Error('Refusing to remove an unexpected temporary configuration path.');
   }
   fs.rmSync(config.workDirectory, { recursive: true, force: true, maxRetries: 5 });
-  if (config.sourceDirectory) {
+  if (config.checkout && config.sourceDirectory) {
     fs.rmSync(config.sourceDirectory, { recursive: true, force: true, maxRetries: 5 });
   }
 }

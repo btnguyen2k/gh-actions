@@ -243,6 +243,7 @@ jobs:
         with:
           image: dockerbp-ci/local
           target-sha: ${{ needs.CaptureContext.outputs.target-sha }}
+          checkout: false
           platforms: ${{ runner.os == 'Windows' && 'windows/amd64' || 'linux/amd64,linux/arm64' }}
           context: dockerbp/tests/fixtures
           dockerfile: ${{ runner.os == 'Windows' && 'Dockerfile.windows' || 'Dockerfile' }}
@@ -272,6 +273,11 @@ jobs:
             done
           done
           echo "✅ Local image tags and platforms are retained."
+      - name: Check native Linux digest publication against a local registry
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          DOCKERBP_NATIVE_PUBLISH_TEST: "true"
+        run: node --test --test-name-pattern="native Linux publication" dockerbp/tests/manifest.test.cjs
       - name: Check tracked generated files
         run: git diff --exit-code HEAD --
 

@@ -7,3 +7,8 @@
 # Follow each header line with the list of changes for that release.
 # touch = 1
 
+#!dockerbp/v0.3.0
+- feat(action): support caller-managed source checkout
+- change(action): publish Linux images without staging tags
+- change(action): update build records and require upgraded merge steps
+- remove(action): drop Windows ARM64 support
