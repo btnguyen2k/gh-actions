@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.3.0
 name: Docker Build and Publish
 description: Build Linux or Windows images and combine distributed builds into Docker Hub tags.
 
@@ -9,11 +9,14 @@ inputs:
   target-sha:
     description: Full source commit SHA; defaults to github.sha.
     default: ${{ github.sha }}
+  checkout:
+    description: Check out source at target-sha. Set false to use the caller's checkout in github.workspace, whose HEAD must match target-sha. Ignored in merge.
+    default: "true"
   tags:
     description: Comma-separated or multiline bare tags; defaults to latest. The full SHA tag is always included.
     default: latest
   platforms:
-    description: Comma-separated or multiline platforms to build (e.g. linux/amd64, linux/arm64), or the complete expected set in merge mode.
+    description: Comma-separated or multiline linux/amd64, linux/arm64, or windows/amd64 to build, or the complete expected set in merge mode.
     default: linux/amd64
   publish:
     description: "String: false for cache-only builds, true to publish to Docker Hub, or local to retain tagged images in build mode. Merge requires true."
@@ -22,13 +25,13 @@ inputs:
     description: Dockerfile path relative to the build context.
     default: Dockerfile
   context:
-    description: Build context relative to the pinned source checkout.
+    description: Build context relative to the selected source checkout.
     default: ./
   mode:
     description: build for one job, build-shard for distributed builds, or merge to publish their combined manifest.
     default: build
   build-records:
-    description: JSON result file or directory of downloaded result files; required in merge mode.
+    description: Published schema-1 or schema-2 JSON result file or directory of downloaded result files; required in merge mode.
     default: ""
 
 outputs:
@@ -51,7 +54,7 @@ outputs:
     description: Absolute path to a JSON build result for artifact transfer; empty in merge mode.
     value: ${{ steps.execute.outputs.record-file }}
   staging-tags:
-    description: Newline-separated temporary registry references retained for caller-managed retention.
+    description: Newline-separated retained registry tags from Windows or legacy records. Empty for digest-only Linux, cache-only, or local builds.
     value: ${{ steps.execute.outputs.staging-tags }}
 
 runs:
@@ -63,6 +66,7 @@ runs:
       env:
         DOCKERBP_IMAGE: ${{ inputs.image }}
         DOCKERBP_TARGET_SHA: ${{ inputs.target-sha }}
+        DOCKERBP_CHECKOUT: ${{ inputs.checkout }}
         DOCKERBP_TAGS: ${{ inputs.tags }}
         DOCKERBP_PLATFORMS: ${{ inputs.platforms }}
         DOCKERBP_PUBLISH: ${{ inputs.publish }}
@@ -72,7 +76,7 @@ runs:
         DOCKERBP_BUILD_RECORDS: ${{ inputs.build-records }}
       run: node "$GITHUB_ACTION_PATH/main.cjs" prepare
     - name: Checkout pinned source
-      if: ${{ steps.prepare.outputs.backend != 'merge' }}
+      if: ${{ steps.prepare.outputs.checkout == 'true' }}
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: ${{ github.repository }}

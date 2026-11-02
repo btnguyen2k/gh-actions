@@ -11,9 +11,12 @@ const {
 const SHA = 'a'.repeat(40);
 const IMAGE = 'docker.io/owner/app';
 const LINUX_DIGEST = `sha256:${'1'.repeat(64)}`;
+const LINUX_ARM64_DIGEST = `sha256:${'4'.repeat(64)}`;
+const LINUX_INDEX_DIGEST = `sha256:${'5'.repeat(64)}`;
 const WINDOWS_DIGEST = `sha256:${'2'.repeat(64)}`;
 const FINAL_DIGEST = `sha256:${'3'.repeat(64)}`;
 const LINUX = { digest: LINUX_DIGEST, platform: { os: 'linux', architecture: 'amd64' } };
+const LINUX_ARM64 = { digest: LINUX_ARM64_DIGEST, platform: { os: 'linux', architecture: 'arm64', variant: 'v8' } };
 const WINDOWS = {
   digest: WINDOWS_DIGEST,
   platform: { os: 'windows', architecture: 'amd64', 'os.version': '10.0.26100.1', 'os.features': ['win32k'] },
@@ -50,7 +53,7 @@ function fakeDocker(config, manifests = [LINUX], fail = () => false) {
     if (fail(args)) throw new Error('Simulated Docker failure.');
     if (args[0] === 'buildx' && args[1] === 'build') {
       fs.writeFileSync(args[args.indexOf('--metadata-file') + 1], JSON.stringify({
-        'containerimage.digest': LINUX_DIGEST,
+        'containerimage.digest': manifests.length > 1 ? LINUX_INDEX_DIGEST : manifests[0].digest,
       }));
       return '';
     }
@@ -60,7 +63,8 @@ function fakeDocker(config, manifests = [LINUX], fail = () => false) {
     }
     if (args[0] === 'manifest' && args[1] === 'inspect') {
       const digest = args.at(-1).split('@')[1];
-      const selected = manifests.filter(item => digest === item.digest);
+      const selected = manifests.filter(item => digest === item.digest ||
+        (digest === LINUX_INDEX_DIGEST && item.platform.os === 'linux'));
       return JSON.stringify((selected.length ? selected : manifests).map(item => ({ Descriptor: item })));
     }
     if (args[0] === 'manifest' && ['create', 'annotate'].includes(args[1])) return '';
@@ -118,13 +122,14 @@ test('rejects malformed or unsafe inputs rather than passing them to a shell', (
     [{ DOCKERBP_TARGET_SHA: '', GITHUB_SHA: '' }, /full 40-character/],
     [{ DOCKERBP_TAGS: '$(whoami)' }, /bare Docker tags/],
     [{ DOCKERBP_TAGS: `a${'b'.repeat(128)}` }, /bare Docker tags/],
+    [{ DOCKERBP_CHECKOUT: 'yes' }, /checkout must be true or false/],
     [{ DOCKERBP_PUBLISH: 'yes' }, /publish must/],
     [{ DOCKERBP_MODE: 'build-shard', DOCKERBP_PUBLISH: 'local' }, /only in mode=build/],
     [{ DOCKERBP_MODE: 'merge', DOCKERBP_PUBLISH: 'local', DOCKERBP_BUILD_RECORDS: 'records' }, /only in mode=build/],
     [{ DOCKERBP_MODE: 'unknown' }, /mode must/],
     [{ DOCKERBP_PLATFORMS: 'linux/386' }, /platforms must/],
     [{ DOCKERBP_PLATFORMS: 'linux/amd64,windows/amd64' }, /separate build-shard/],
-    [{ DOCKERBP_PLATFORMS: 'windows/amd64,windows/arm64' }, /one native Windows/],
+    [{ DOCKERBP_PLATFORMS: 'windows/amd64,windows/arm64' }, /platforms must/],
     [{ DOCKERBP_CONTEXT: '../outside' }, /relative path/],
     [{ DOCKERBP_CONTEXT: 'C:\\outside' }, /relative path/],
     [{ DOCKERBP_CONTEXT: '\\\\host\\share' }, /relative path/],
@@ -141,13 +146,27 @@ test('accepts Docker Hub prefixes, nested paths, and mixed-OS merge expectations
     DOCKERBP_IMAGE: 'docker.io/owner/app',
     DOCKERBP_CONTEXT: 'source\\app', DOCKERBP_DOCKERFILE: 'docker\\Dockerfile',
     DOCKERBP_MODE: 'merge', DOCKERBP_PUBLISH: 'true', DOCKERBP_BUILD_RECORDS: 'records',
-    DOCKERBP_PLATFORMS: 'linux/arm64,windows/arm64',
+    DOCKERBP_PLATFORMS: 'linux/arm64,windows/amd64',
   }));
   assert.equal(config.image, IMAGE);
   assert.equal(config.context, 'source/app');
   assert.equal(config.dockerfile, 'docker/Dockerfile');
   assert.equal(normalizeInputs(inputs({ DOCKERBP_IMAGE: 'app' })).image, 'docker.io/library/app');
   assert.equal(normalizeInputs(inputs({ DOCKERBP_IMAGE: 'index.docker.io/owner/app' })).image, IMAGE);
+});
+
+test('Windows ARM64 is rejected in every mode before contacting a Docker daemon', async t => {
+  for (const mode of ['build', 'build-shard', 'merge']) {
+    const { root, config } = fixture(t);
+    await assert.rejects(prepare({
+      ...inputs({
+        DOCKERBP_MODE: mode, DOCKERBP_PUBLISH: 'true',
+        DOCKERBP_PLATFORMS: 'windows/arm64', DOCKERBP_BUILD_RECORDS: 'records',
+      }),
+      GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root,
+      GITHUB_OUTPUT: path.join(root, 'output.txt'),
+    }, async () => assert.fail('Unexpected Docker invocation.'), 'win32'), /platforms must contain only/);
+  }
 });
 
 test('preparation checks daemon OS/native architecture and only requests needed Linux emulation', async t => {
@@ -160,23 +179,96 @@ test('preparation checks daemon OS/native architecture and only requests needed 
   const result = await prepare(env, async () => '{"Os":"linux","Arch":"amd64"}', 'linux');
   t.after(() => cleanup(result));
   assert.match(fs.readFileSync(output, 'utf8'), /qemu-platforms<<[^\n]+\narm64\n/);
+  assert.match(fs.readFileSync(output, 'utf8'), /checkout<<[^\n]+\ntrue\n/);
   assert.notEqual(result.sourceDirectory, config.workspace);
   assert.equal(path.dirname(result.sourceDirectory), config.workspace);
   await assert.rejects(prepare(env, async () => '{"Os":"windows","Arch":"amd64"}', 'linux'), /container mode/);
   await assert.rejects(prepare(env, async () => '{}', 'darwin'), /native linux runner/);
   await assert.rejects(prepare({
-    ...env, DOCKERBP_PLATFORMS: 'windows/arm64',
-  }, async () => '{"Os":"windows","Arch":"amd64"}', 'win32'), /architecture must match/);
+    ...env, DOCKERBP_PLATFORMS: 'windows/amd64',
+  }, async () => '{"Os":"windows","Arch":"arm64"}', 'win32'), /architecture must match/);
 });
 
 test('merge preparation does not contact a Docker daemon or allocate a source checkout', async t => {
+  for (const checkout of ['true', 'false']) {
+    await t.test(checkout, async t => {
+      const { root, config } = fixture(t);
+      const output = path.join(root, 'output.txt');
+      const result = await prepare({
+        ...inputs({
+          DOCKERBP_MODE: 'merge', DOCKERBP_PUBLISH: 'true', DOCKERBP_BUILD_RECORDS: 'records',
+          DOCKERBP_CHECKOUT: checkout,
+        }),
+        GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root, GITHUB_OUTPUT: output,
+      }, async () => { throw new Error('Unexpected Docker invocation.'); }, 'darwin');
+      t.after(() => cleanup(result));
+      assert.equal(result.sourceDirectory, undefined);
+      assert.match(fs.readFileSync(output, 'utf8'), /checkout<<[^\n]+\nfalse\n/);
+    });
+  }
+});
+
+test('caller checkout builds use workspace files and leave caller-owned source untouched', async t => {
+  for (const backend of ['linux', 'windows']) {
+    for (const mode of ['build', 'build-shard']) {
+      await t.test(`${backend} ${mode}`, async t => {
+        const { root, config, env } = fixture(t);
+        const output = path.join(root, 'output.txt');
+        const generated = path.join(config.workspace, 'generated.txt');
+        fs.writeFileSync(path.join(config.workspace, 'Dockerfile'), 'FROM scratch\nCOPY generated.txt /\n');
+        fs.writeFileSync(generated, 'caller-generated build content\n');
+        const files = fs.readdirSync(config.workspace).sort();
+        const result = await prepare({
+          ...inputs({
+            DOCKERBP_CHECKOUT: ' FALSE ', DOCKERBP_MODE: mode,
+            DOCKERBP_PLATFORMS: `${backend}/amd64`,
+          }),
+          GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root, GITHUB_OUTPUT: output,
+        }, async () => JSON.stringify({ Os: backend, Arch: 'amd64' }),
+        backend === 'windows' ? 'win32' : 'linux');
+        t.after(() => cleanup(result));
+        assert.equal(result.sourceDirectory, config.workspace);
+        assert.deepEqual(fs.readdirSync(config.workspace).sort(), files);
+        assert.match(fs.readFileSync(output, 'utf8'), /checkout<<[^\n]+\nfalse\n/);
+        assert.match(fs.readFileSync(output, 'utf8'), /checkout-path<<[^\n]+\n\n/);
+        await verifySource(result, async (command, args, options) => {
+          assert.equal(command, 'git');
+          assert.deepEqual(args, ['rev-parse', 'HEAD']);
+          assert.equal(options.cwd, config.workspace);
+          return SHA;
+        });
+        const { exec, calls } = fakeDocker(result);
+        const built = await run(result, exec, env);
+        assert.equal(calls[0].args.at(-1), fs.realpathSync(config.workspace));
+        assert.equal(calls[0].args[calls[0].args.indexOf('--file') + 1],
+          fs.realpathSync(path.join(config.workspace, 'Dockerfile')));
+        assert.equal(fs.readFileSync(path.join(result.contextDirectory, 'generated.txt'), 'utf8'),
+          'caller-generated build content\n');
+        cleanup(result);
+        assert.equal(fs.existsSync(result.workDirectory), false);
+        assert.equal(fs.existsSync(built['record-file']), true);
+        assert.deepEqual(fs.readdirSync(config.workspace).sort(), files);
+        assert.equal(fs.readFileSync(generated, 'utf8'), 'caller-generated build content\n');
+      });
+    }
+  }
+});
+
+test('a mismatched caller checkout stays fatal and cleanup preserves the caller workspace', async t => {
   const { root, config } = fixture(t);
+  const marker = path.join(config.workspace, 'caller.txt');
+  fs.writeFileSync(marker, 'keep caller files\n');
   const result = await prepare({
-    ...inputs({ DOCKERBP_MODE: 'merge', DOCKERBP_PUBLISH: 'true', DOCKERBP_BUILD_RECORDS: 'records' }),
+    ...inputs({ DOCKERBP_CHECKOUT: 'false' }),
     GITHUB_WORKSPACE: config.workspace, RUNNER_TEMP: root, GITHUB_OUTPUT: path.join(root, 'output.txt'),
-  }, async () => { throw new Error('Unexpected Docker invocation.'); }, 'darwin');
+  }, async () => '{"Os":"linux","Arch":"amd64"}', 'linux');
   t.after(() => cleanup(result));
-  assert.equal(result.sourceDirectory, undefined);
+  await assert.rejects(verifySource(result, async () => 'b'.repeat(40)), /HEAD does not match target-sha/);
+  await assert.rejects(run(result, async () => assert.fail('Unexpected build.')), /must be verified/);
+  cleanup(result);
+  assert.equal(fs.existsSync(result.workDirectory), false);
+  assert.equal(fs.existsSync(result.recordFile), false);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'keep caller files\n');
 });
 
 test('multi-platform local preparation requires containerd before allocating build files', async t => {
@@ -245,24 +337,31 @@ test('rejects context and Dockerfile symlinks escaping the pinned build paths', 
 });
 
 test('Linux build-only is cache-only and cannot produce a mergeable registry result', async t => {
-  const { config, env } = fixture(t);
-  const { exec, calls } = fakeDocker(config);
-  const result = await run(config, exec, env);
-  assert.equal(result.status, 'built');
-  assert.equal(result.digest, '');
-  assert.equal(result['staging-tags'], '');
-  const args = calls[0].args;
-  assert.equal(args[args.indexOf('--output') + 1], 'type=cacheonly');
-  assert.equal(args[args.indexOf('--file') + 1], config.dockerfilePath);
-  assert.equal(args.at(-1), config.contextDirectory);
-  assert.equal(calls.length, 1);
-  const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
-  assert.equal(built.published, false);
-  assert.deepEqual(built.manifests, []);
+  for (const platforms of ['linux/amd64', 'linux/arm64', 'linux/amd64,linux/arm64']) {
+    await t.test(platforms, async t => {
+      const { config, env } = fixture(t, normalizeInputs(inputs({ DOCKERBP_PLATFORMS: platforms })));
+      const { exec, calls } = fakeDocker(config);
+      const result = await run(config, exec, env);
+      assert.equal(result.status, 'built');
+      assert.equal(result.digest, '');
+      assert.equal(result['staging-tags'], '');
+      const args = calls[0].args;
+      assert.equal(args[args.indexOf('--output') + 1], 'type=cacheonly');
+      assert.equal(args[args.indexOf('--platform') + 1], platforms);
+      assert.equal(args[args.indexOf('--file') + 1], config.dockerfilePath);
+      assert.equal(args.at(-1), config.contextDirectory);
+      assert.equal(calls.length, 1);
+      const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+      assert.equal(built.schema, 1);
+      assert.equal(built.published, false);
+      assert.equal(built.stagingTag, '');
+      assert.deepEqual(built.manifests, []);
+    });
+  }
 });
 
 test('Linux local builds load every requested platform with requested and full-SHA tags', async t => {
-  for (const platforms of ['linux/amd64', 'linux/amd64,linux/arm64']) {
+  for (const platforms of ['linux/amd64', 'linux/arm64', 'linux/amd64,linux/arm64']) {
     await t.test(platforms, async t => {
       const { config, env } = fixture(t, normalizeInputs(inputs({
         DOCKERBP_PUBLISH: 'local', DOCKERBP_PLATFORMS: platforms,
@@ -282,26 +381,63 @@ test('Linux local builds load every requested platform with requested and full-S
       assert.equal(result.digest, '');
       assert.equal(result['staging-tags'], '');
       assert.equal(fs.existsSync(path.join(config.workDirectory, 'docker-config')), false);
-      assert.equal(JSON.parse(fs.readFileSync(result['record-file'], 'utf8')).published, false);
+      const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+      assert.equal(built.schema, 1);
+      assert.equal(built.published, false);
+      assert.equal(built.stagingTag, '');
       cleanup(config);
       assert.equal(calls.length, 1);
     });
   }
 });
 
-test('a published Linux shard emits immutable metadata but never changes final tags', async t => {
-  const { config, env } = fixture(t, { publish: true, mode: 'build-shard' });
-  const { exec, calls } = fakeDocker(config);
-  const result = await run(config, exec, env);
-  assert.equal(result.status, 'shard-published');
-  assert.equal(result.digest, LINUX_DIGEST);
-  assert.equal(calls.some(call => call.args[0] === 'manifest' && call.args[1] !== 'inspect'), false);
-  const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
-  assert.equal(built.targetSha, SHA);
-  assert.equal(built.image, IMAGE);
-  assert.deepEqual(built.manifests, [LINUX]);
-  assert.match(built.stagingTag, new RegExp(`^${IMAGE}:dockerbp-${SHA}-linux-amd64-[a-f0-9]+$`));
-  assert.equal(JSON.stringify(built).includes('auths'), false);
+test('Linux publication pushes each platform combination by digest without staging tags', async t => {
+  for (const mode of ['build', 'build-shard']) {
+    for (const platforms of ['linux/amd64', 'linux/arm64', 'linux/amd64,linux/arm64']) {
+      await t.test(`${mode} ${platforms}`, async t => {
+        const { config, env } = fixture(t, normalizeInputs(inputs({
+          DOCKERBP_MODE: mode, DOCKERBP_PUBLISH: 'true', DOCKERBP_PLATFORMS: platforms,
+          DOCKERBP_TAGS: 'dev',
+        })));
+        const manifests = [LINUX, LINUX_ARM64].filter(item =>
+          config.platforms.includes(`${item.platform.os}/${item.platform.architecture}`));
+        const { exec, calls } = fakeDocker(config, manifests);
+        const result = await run(config, exec, env);
+        const args = calls[0].args;
+        assert.equal(args[args.indexOf('--output') + 1],
+          `type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false`);
+        assert.equal(args.includes('--tag'), false);
+        assert.equal(args.includes('--load'), false);
+        assert.equal(args[args.indexOf('--platform') + 1], platforms);
+        assert.equal(result.status, mode === 'build' ? 'published' : 'shard-published');
+        assert.equal(result['staging-tags'], '');
+        const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+        assert.equal(built.schema, 2);
+        assert.equal(built.targetSha, SHA);
+        assert.equal(built.image, IMAGE);
+        assert.deepEqual(built.manifests, manifests);
+        assert.equal(built.stagingTag, '');
+        assert.equal(JSON.stringify(built).includes('auths'), false);
+        assert.equal(readBuildRecords({ ...config, records: result['record-file'] }).length, 1);
+        if (mode === 'build-shard') {
+          assert.equal(result.digest, built.digest);
+          assert.equal(calls.some(call => call.args[0] === 'manifest' && call.args[1] !== 'inspect'), false);
+        } else {
+          assert.equal(result.digest, FINAL_DIGEST);
+          assert.deepEqual(calls.filter(call => call.args[1] === 'create').map(call => call.args[2]),
+            [`${IMAGE}:dev`, `${IMAGE}:${SHA}`]);
+        }
+      });
+    }
+  }
+});
+
+test('Linux registry platform mismatches fail before publishing final tags or result records', async t => {
+  const { config, env } = fixture(t, { publish: true, platforms: ['linux/arm64'] });
+  const { exec, calls } = fakeDocker(config, [LINUX]);
+  await assert.rejects(run(config, exec, env), /must cover exactly/);
+  assert.equal(calls.some(call => call.args[1] === 'create' || call.args[1] === 'push'), false);
+  assert.equal(fs.existsSync(config.recordFile), false);
 });
 
 test('single-job publication owns both requested and full-SHA final tags', async t => {
@@ -316,24 +452,40 @@ test('single-job publication owns both requested and full-SHA final tags', async
   assert.equal(result.tags, `${IMAGE}:0.1.0\n${IMAGE}:latest\n${IMAGE}:${SHA}`);
 });
 
-test('native Windows shards use the legacy builder, find the correct repository digest, and remove only their local tag', async t => {
-  const { config, env } = fixture(t, {
-    backend: 'windows', platforms: ['windows/amd64'], publish: true, mode: 'build-shard',
-  });
-  const { exec, calls } = fakeDocker(config, [WINDOWS]);
-  const result = await run(config, exec, env);
-  assert.equal(result.digest, WINDOWS_DIGEST);
-  assert.deepEqual(calls[0].args.slice(0, 4), ['image', 'build', '--platform', 'windows/amd64']);
-  assert.equal(calls[0].options.env.DOCKER_BUILDKIT, '0');
-  const staging = result['staging-tags'];
-  assert.deepEqual(calls.find(call => call.args[1] === 'rm').args, ['image', 'rm', '--no-prune', staging]);
-  assert.deepEqual(JSON.parse(fs.readFileSync(result['record-file'], 'utf8')).manifests, [WINDOWS]);
+test('native Windows publication retains registry staging and removes only its private local tag', async t => {
+  for (const mode of ['build', 'build-shard']) {
+    await t.test(mode, async t => {
+      const { config, env } = fixture(t, {
+        backend: 'windows', platforms: ['windows/amd64'], publish: true, mode,
+      });
+      const { exec, calls } = fakeDocker(config, [WINDOWS]);
+      const result = await run(config, exec, env);
+      assert.equal(result.digest, mode === 'build' ? FINAL_DIGEST : WINDOWS_DIGEST);
+      assert.deepEqual(calls[0].args.slice(0, 4), ['image', 'build', '--platform', 'windows/amd64']);
+      assert.equal(calls[0].options.env.DOCKER_BUILDKIT, '0');
+      const staging = result['staging-tags'];
+      assert.match(staging, new RegExp(`^${IMAGE}:dockerbp-${SHA}-windows-amd64-[a-f0-9]+$`));
+      assert.deepEqual(calls.find(call => call.args[0] === 'image' && call.args[1] === 'push').args,
+        ['image', 'push', staging]);
+      assert.deepEqual(calls.find(call => call.args[1] === 'rm').args, ['image', 'rm', '--no-prune', staging]);
+      const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+      assert.equal(built.schema, 2);
+      assert.deepEqual(built.manifests, [WINDOWS]);
+      assert.equal(readBuildRecords({ ...config, records: result['record-file'] }).length, 1);
+    });
+  }
 });
 
 test('native Windows build-only removes its temporary tag without pushing', async t => {
   const { config, env } = fixture(t, { backend: 'windows', platforms: ['windows/amd64'] });
   const { exec, calls } = fakeDocker(config);
-  assert.equal((await run(config, exec, env)).status, 'built');
+  const result = await run(config, exec, env);
+  assert.equal(result.status, 'built');
+  assert.equal(result.digest, '');
+  assert.equal(result['staging-tags'], '');
+  const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+  assert.equal(built.schema, 1);
+  assert.equal(built.published, false);
   assert.deepEqual(calls.map(call => call.args.slice(0, 2)), [['image', 'build'], ['image', 'rm']]);
 });
 
@@ -354,7 +506,9 @@ test('native Windows local builds retain requested and full-SHA tags without pus
   assert.equal(result.status, 'local-built');
   assert.equal(result.digest, '');
   assert.equal(result['staging-tags'], '');
-  assert.equal(JSON.parse(fs.readFileSync(result['record-file'], 'utf8')).published, false);
+  const built = JSON.parse(fs.readFileSync(result['record-file'], 'utf8'));
+  assert.equal(built.schema, 1);
+  assert.equal(built.published, false);
   cleanup(config);
   assert.equal(calls.length, 1);
 });
@@ -383,15 +537,40 @@ test('Windows push failures stay fatal and still remove the private local tag', 
   assert.equal(fs.existsSync(config.recordFile), false);
 });
 
-test('merges complete Linux/Windows records by digest and preserves Windows OS details', async t => {
+test('Linux-only merges accept digest-only and legacy tagged shards', async t => {
+  for (const schema of [1, 2]) {
+    await t.test(`schema ${schema}`, async t => {
+      const { config, env } = fixture(t, {
+        mode: 'merge', backend: 'merge', publish: true, platforms: ['linux/amd64', 'linux/arm64'],
+      });
+      const manifests = [LINUX, LINUX_ARM64];
+      const stages = manifests.map(item => `${IMAGE}:dockerbp-${item.platform.architecture}`);
+      writeRecords(config, manifests.map((item, index) => record(config, [item], {
+        schema, stagingTag: schema === 1 ? stages[index] : '',
+      })));
+      const { exec, calls } = fakeDocker(config, manifests);
+      const result = await run(config, exec, env);
+      assert.equal(result.status, 'published');
+      assert.equal(result['staging-tags'], schema === 1 ? stages.join('\n') : '');
+      assert.deepEqual(calls.find(call => call.args[1] === 'create').args.slice(3),
+        manifests.map(item => `${IMAGE}@${item.digest}`));
+    });
+  }
+});
+
+test('merges digest-only Linux and legacy tagged Windows records while preserving OS details', async t => {
   const { config, env } = fixture(t, {
     mode: 'merge', backend: 'merge', publish: true, platforms: ['linux/amd64', 'windows/amd64'],
   });
-  writeRecords(config, [record(config, [LINUX]), record(config, [WINDOWS])]);
+  writeRecords(config, [
+    record(config, [LINUX], { schema: 2, stagingTag: undefined }),
+    record(config, [WINDOWS]),
+  ]);
   const { exec, calls } = fakeDocker(config, [LINUX, WINDOWS]);
   const result = await run(config, exec, env);
   assert.equal(result.status, 'published');
   assert.equal(result['record-file'], '');
+  assert.equal(result['staging-tags'], `${IMAGE}:dockerbp-shard`);
   const creates = calls.filter(call => call.args[1] === 'create');
   assert.deepEqual(creates[0].args.slice(3), [`${IMAGE}@${LINUX_DIGEST}`, `${IMAGE}@${WINDOWS_DIGEST}`]);
   const windows = calls.filter(call => call.args[1] === 'annotate' && call.args.includes('--os=windows'));
@@ -409,8 +588,12 @@ test('missing, duplicate, inconsistent, and unpublished records fail before regi
     ['wrong image', config => [record(config, [LINUX], { image: 'docker.io/other/app' })]],
     ['wrong SHA', config => [record(config, [LINUX], { targetSha: 'b'.repeat(40) })]],
     ['unpublished', config => [record(config, [LINUX], { published: false })]],
-    ['wrong schema', config => [record(config, [LINUX], { schema: 2 })]],
+    ['wrong schema', config => [record(config, [LINUX], { schema: 3 })]],
     ['bad digest', config => [record(config, [LINUX], { digest: 'latest' })]],
+    ['legacy missing staging', config => [record(config, [LINUX], { stagingTag: undefined })]],
+    ['malformed staging', config => [record(config, [LINUX], { schema: 2, stagingTag: false })]],
+    ['wrong staging image', config => [record(config, [LINUX], { schema: 2, stagingTag: 'docker.io/other/app:tag' })]],
+    ['Windows ARM64', config => [record(config, [{ ...WINDOWS, platform: { ...WINDOWS.platform, architecture: 'arm64' } }])]],
     ['missing Windows version', config => [record(config, [{ ...WINDOWS, platform: { os: 'windows', architecture: 'amd64' } }])]],
   ]) {
     await t.test(name, async t => {
@@ -423,6 +606,16 @@ test('missing, duplicate, inconsistent, and unpublished records fail before regi
       assert.deepEqual(calls, []);
     });
   }
+});
+
+test('merge rejects more than three records before registry calls', async t => {
+  const { config, env } = fixture(t, {
+    mode: 'merge', backend: 'merge', publish: true, platforms: ['linux/amd64'],
+  });
+  writeRecords(config, Array.from({ length: 4 }, () => record(config, [LINUX])));
+  const { exec, calls } = fakeDocker(config);
+  await assert.rejects(run(config, exec, env), /between one and 3/);
+  assert.deepEqual(calls, []);
 });
 
 test('registry metadata mismatches fail before any final manifest is created', async t => {
